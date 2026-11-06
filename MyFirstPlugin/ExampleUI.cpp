@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <string>
 
 START_NAMESPACE_DISTRHO
 
@@ -14,7 +17,7 @@ class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(400, 340),
+    : UI(400, 390),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -29,13 +32,33 @@ public:
 
 protected:
 
-    bool onMouse(const MouseEvent& ev) override
+      bool onMouse(const MouseEvent& ev) override
     {
         if (ev.button != 1 || !ev.press)
             return false;
 
         const double x = ev.pos.getX();
         const double y = ev.pos.getY();
+
+        // Text field: click inside to edit, click anywhere else to stop editing.
+        const double fy = getHeight() - 148.0;
+        const bool inField = x >= 70 && x <= getWidth() - 20
+                          && y >= fy && y <= fy + 24.0;
+
+        if (inField)
+        {
+            fEditing = true;
+            repaint();
+            return true;
+        }
+
+        if (fEditing)
+        {
+            fEditing = false;
+            repaint();
+        }
+
+        // Buttons.
         const double by = getHeight() - 108.0;
 
         if (y < by || y > by + 24.0)
@@ -52,12 +75,59 @@ protected:
         if (x >= 130 && x <= 230)
         {
             char buf[16];
-            std::snprintf(buf, sizeof(buf), "%u", ++fSaveCount); // unique value each click
+            std::snprintf(buf, sizeof(buf), "%u", ++fSaveCount);
             setState("save", buf);
             return true;
         }
 
         return false;
+    }
+
+      bool onKeyboard(const KeyboardEvent& ev) override
+    {
+        if (!fEditing)
+            return false;
+
+        // Special keys arrive here; printable characters arrive in onCharacterInput.
+        // 0x08 = backspace, 0x1B = escape (DPF's kKeyBackspace / kKeyEscape).
+        if (ev.press)
+        {
+            if (ev.key == 0x08)
+            {
+                if (!fName.empty())
+                {
+                    fName.pop_back();
+                    commitName();
+                }
+            }
+            else if (ev.key == 0x1B || ev.key == '\r' || ev.key == '\n')
+            {
+                fEditing = false;
+                repaint();
+            }
+        }
+
+        return ev.key == 0x08 || ev.key == 0x1B || ev.key == '\r' || ev.key == '\n';
+    }
+
+    bool onCharacterInput(const CharacterInputEvent& ev) override
+    {
+        if (!fEditing)
+            return false;
+
+        const uint32_t c = ev.character;
+
+        // Same character set the plugin's sanitize() allows.
+        const bool allowed = c < 128
+                          && (std::isalnum(static_cast<int>(c)) || c == '-' || c == '_' || c == ' ');
+
+        if (allowed && fName.size() < 32)
+        {
+            fName += static_cast<char>(c);
+            commitName();
+        }
+
+        return true; // swallow everything while editing
     }
   
     void uiIdle() override
@@ -170,6 +240,8 @@ protected:
             }
         }
 
+        drawTextField(20, height - 148.0f, width - 40.0f, 24.0f);	
+
         const float by = height - 108.0f;
         drawButton(fRecording ? "STOP" : "REC", 20, by, 100, 24,
                    fRecording ? Color(200, 60, 60) : Color(70, 70, 80));
@@ -197,7 +269,14 @@ protected:
         repaint();
     }
 
-  void stateChanged(const char*, const char*) override {}
+      void stateChanged(const char* key, const char* value) override
+    {
+        if (std::strcmp(key, "name") == 0 && !fEditing)
+        {
+            fName = value;
+            repaint();
+        }
+    }
 
 private:
     MidiMonitorAccess* fMidiMonitor;
@@ -210,6 +289,48 @@ private:
 
     bool fRecording = false;
     uint32_t fSaveCount = 0;
+
+    std::string fName { "sample" };
+    bool fEditing = false;
+
+    void commitName()
+    {
+        setState("name", fName.c_str());
+        repaint();
+    }
+
+    void drawTextField(float x, float y, float w, float h)
+    {
+        const float labelW = 50.0f;
+        const float fx = x + labelW;
+        const float fw = w - labelW;
+
+        fontSize(12.0f);
+        fillColor(Color(220, 220, 225));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x, y + h * 0.5f, "NAME", nullptr);
+
+        beginPath();
+        roundedRect(fx, y, fw, h, 4.0f);
+        fillColor(fEditing ? Color(60, 60, 72) : Color(45, 45, 52));
+        fill();
+
+        if (fEditing)
+        {
+            beginPath();
+            roundedRect(fx, y, fw, h, 4.0f);
+            strokeColor(Color(100, 220, 140));
+            strokeWidth(1.0f);
+            stroke();
+        }
+
+        // A trailing underscore stands in for the caret while editing.
+        const std::string shown = fEditing ? fName + "_" : fName;
+
+        fontSize(13.0f);
+        fillColor(Color(255, 255, 255));
+        text(fx + 8.0f, y + h * 0.5f, shown.c_str(), nullptr);
+    }  
 
     void drawButton(const char* label, float x, float y, float w, float h, Color c)
     {
