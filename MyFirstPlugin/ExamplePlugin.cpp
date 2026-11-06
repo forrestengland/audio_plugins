@@ -21,6 +21,18 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <vector>
+#include <string>
+#include <cstdlib>
+#include <cctype>
+
+#ifdef _WIN32
+ #include <direct.h>
+ #define MKDIR(p) _mkdir(p)
+#else
+ #include <sys/stat.h>
+ #define MKDIR(p) mkdir(p, 0755)
+#endif
 
 START_NAMESPACE_DISTRHO
 
@@ -33,11 +45,15 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(3, 0, 0), // 3 parameters, 0 programs, 0 states
+        : MidiMonitorPlugin(4, 0, 3), // 3 parameters, 0 programs, 0 states
           fColor(0.0f),
           fOutLeft(0.0f),
-          fOutRight(0.0f)
+          fOutRight(0.0f),
+	  fNeedsReset(true)
     {
+      fRecCapacity = static_cast<uint32_t>(getSampleRate() * 30.0); // 30 s
+      fRecL.assign(fRecCapacity, 0.0f);
+      fRecR.assign(fRecCapacity, 0.0f); 
     }
   
     bool popMidiEvent(MidiMonitorEvent& event) noexcept override
@@ -170,6 +186,11 @@ protected:
             parameter.name   = "out-right";
             parameter.symbol = "out_right";
             break;
+        case 3:
+            parameter.hints  = kParameterIsAutomatable|kParameterIsBoolean;
+            parameter.name   = "record";
+            parameter.symbol = "record";
+            break;
         }
     }
 
@@ -177,10 +198,15 @@ protected:
       Set a state key and default value.
       This function will be called once, shortly after the plugin is created.
     */
-    void initState(uint32_t, String&, String&) override
+    void initState(uint32_t index, String& key, String& defaultValue) override
     {
-        // we are using states but don't want them saved in the host
-    }
+        switch (index)
+        {
+        case 0: key = "name";   defaultValue = "sample"; break;
+        case 1: key = "folder"; defaultValue = "";       break;
+        case 2: key = "save";   defaultValue = "";       break;
+        }
+    }  
 
    /* --------------------------------------------------------------------------------------------------------
     * Internal data */
@@ -195,6 +221,7 @@ protected:
         case 0: return fColor;
         case 1: return fOutLeft;
         case 2: return fOutRight;
+        case 3: return fRecording.load() ? 1.0f : 0.0f;	  
         }
 
         return 0.0f;
@@ -205,11 +232,22 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
-        // this is only called for input paramters, and we only have one of those.
-        if (index != 0) return;
-
-        fColor = value;
+        switch (index)
+        {
+        case 0: fColor = value; break;
+        case 3: fRecording.store(value > 0.5f); break;
+        }
     }
+
+    void setState(const char* key, const char* value) override
+    {
+        if (std::strcmp(key, "name") == 0)
+            fName = value;
+        else if (std::strcmp(key, "folder") == 0)
+            fFolder = value;
+        else if (std::strcmp(key, "save") == 0)
+            saveRecording();
+    }  
 
    /* --------------------------------------------------------------------------------------------------------
     * Process */
@@ -277,6 +315,26 @@ protected:
         fOutLeft  = std::max(tmpLeft,  fOutLeft  * decay);
         fOutRight = std::max(tmpRight, fOutRight * decay);
 
+        // Record input into RAM (audio thread: copy only, no I/O).
+        const bool rec = fRecording.load(std::memory_order_relaxed);
+        if (rec && !fWasRecording)
+            fRecLen.store(0, std::memory_order_release);
+        fWasRecording = rec;
+
+        if (rec)
+        {
+            const uint32_t len  = fRecLen.load(std::memory_order_relaxed);
+            const uint32_t room = fRecCapacity - len;
+            const uint32_t n    = frames < room ? frames : room;
+
+            if (n > 0)
+            {
+                std::memcpy(&fRecL[len], inputs[0], n * sizeof(float));
+                std::memcpy(&fRecR[len], inputs[1], n * sizeof(float));
+                fRecLen.store(len + n, std::memory_order_release);
+            }
+        }	
+
         // copy inputs over outputs if needed
         if (outputs[0] != inputs[0])
             std::memcpy(outputs[0], inputs[0], sizeof(float)*frames);
@@ -306,7 +364,8 @@ private:
    /**
       Parameters.
     */
-    float fColor, fOutLeft, fOutRight;
+  float fColor, fOutLeft, fOutRight;
+  bool fNeedsReset;
 
    /**
       Boolean used to reset meter values.
@@ -326,6 +385,91 @@ private:
     float  fTargetAmp = 0.0f;
     float  fEnv       = 0.0f;
     int    fNote      = -1;
+
+    std::vector<float> fRecL, fRecR;
+    uint32_t fRecCapacity = 0;
+    std::atomic<bool>     fRecording { false };
+    std::atomic<uint32_t> fRecLen    { 0 };
+    bool fWasRecording = false;
+
+    std::string fName { "sample" };
+    std::string fFolder;
+
+    static void writeLE(std::FILE* f, uint32_t v, int bytes)
+    {
+        for (int i = 0; i < bytes; ++i)
+            std::fputc((v >> (8 * i)) & 0xFF, f);
+    }
+
+    static std::string sanitize(const std::string& in)
+    {
+        std::string out;
+        for (char c : in)
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == ' ')
+                out += c;
+        return out.empty() ? "sample" : out;
+    }
+
+    void saveRecording()
+    {
+        // Guards: nothing recorded (also covers hosts replaying states on load),
+        // or still recording.
+        const uint32_t len = fRecLen.load(std::memory_order_acquire);
+        if (len == 0 || fRecording.load())
+            return;
+
+        std::string folder = fFolder;
+        if (folder.empty())
+        {
+            const char* home = std::getenv("HOME");
+            if (home == nullptr) home = std::getenv("USERPROFILE");
+            folder = std::string(home ? home : ".") + "/Samples";
+        }
+        MKDIR(folder.c_str()); // fine if it already exists
+
+        // Don't overwrite: name.wav, name_2.wav, ...
+        const std::string base = folder + "/" + sanitize(fName);
+        std::string path = base + ".wav";
+        for (int n = 2; ; ++n)
+        {
+            std::FILE* t = std::fopen(path.c_str(), "rb");
+            if (t == nullptr) break;
+            std::fclose(t);
+            path = base + "_" + std::to_string(n) + ".wav";
+        }
+
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (f == nullptr)
+        {
+            std::printf("Could not write %s\n", path.c_str());
+            return;
+        }
+
+        const uint32_t rate     = static_cast<uint32_t>(getSampleRate());
+        const uint32_t dataSize = len * 2 * 2; // frames * channels * 16-bit
+
+        std::fwrite("RIFF", 1, 4, f); writeLE(f, 36 + dataSize, 4);
+        std::fwrite("WAVE", 1, 4, f);
+        std::fwrite("fmt ", 1, 4, f); writeLE(f, 16, 4);
+        writeLE(f, 1, 2);            // PCM
+        writeLE(f, 2, 2);            // channels
+        writeLE(f, rate, 4);
+        writeLE(f, rate * 4, 4);     // byte rate
+        writeLE(f, 4, 2);            // block align
+        writeLE(f, 16, 2);           // bits
+        std::fwrite("data", 1, 4, f); writeLE(f, dataSize, 4);
+
+        for (uint32_t i = 0; i < len; ++i)
+        {
+            const float l = std::max(-1.0f, std::min(1.0f, fRecL[i]));
+            const float r = std::max(-1.0f, std::min(1.0f, fRecR[i]));
+            writeLE(f, static_cast<uint16_t>(static_cast<int16_t>(std::lrintf(l * 32767.0f))), 2);
+            writeLE(f, static_cast<uint16_t>(static_cast<int16_t>(std::lrintf(r * 32767.0f))), 2);
+        }
+
+        std::fclose(f);
+        std::printf("Saved %s (%u frames)\n", path.c_str(), len);
+    }  
 
     void handleNote(const MidiEvent& ev) noexcept
     {

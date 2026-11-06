@@ -14,7 +14,7 @@ class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(400, 300),
+    : UI(400, 340),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -28,6 +28,38 @@ public:
   }
 
 protected:
+
+    bool onMouse(const MouseEvent& ev) override
+    {
+        if (ev.button != 1 || !ev.press)
+            return false;
+
+        const double x = ev.pos.getX();
+        const double y = ev.pos.getY();
+        const double by = getHeight() - 108.0;
+
+        if (y < by || y > by + 24.0)
+            return false;
+
+        if (x >= 20 && x <= 120)
+        {
+            fRecording = !fRecording;
+            setParameterValue(3, fRecording ? 1.0f : 0.0f);
+            repaint();
+            return true;
+        }
+
+        if (x >= 130 && x <= 230)
+        {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%u", ++fSaveCount); // unique value each click
+            setState("save", buf);
+            return true;
+        }
+
+        return false;
+    }
+  
     void uiIdle() override
     {
         if (fMidiMonitor == nullptr)
@@ -138,6 +170,11 @@ protected:
             }
         }
 
+        const float by = height - 108.0f;
+        drawButton(fRecording ? "STOP" : "REC", 20, by, 100, 24,
+                   fRecording ? Color(200, 60, 60) : Color(70, 70, 80));
+        drawButton("SAVE", 130, by, 100, 24, Color(70, 70, 80));	
+
 	// Level meters, anchored to the bottom of the window.
         fontSize(12.0f);
         fillColor(Color(100, 220, 140));
@@ -154,6 +191,7 @@ protected:
         case 0: fColor = value; break;
         case 1: fLevelL = value; break;
         case 2: fLevelR = value; break;
+	case 3: fRecording = value > 0.5f; break;
         }
 
         repaint();
@@ -169,6 +207,23 @@ private:
     float fColor  = 0.0f;
     float fLevelL = 0.0f;
     float fLevelR = 0.0f;
+
+    bool fRecording = false;
+    uint32_t fSaveCount = 0;
+
+    void drawButton(const char* label, float x, float y, float w, float h, Color c)
+    {
+        beginPath();
+        roundedRect(x, y, w, h, 4.0f);
+        fillColor(c);
+        fill();
+
+        fontSize(12.0f);
+        fillColor(Color(255, 255, 255));
+        textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+        text(x + w * 0.5f, y + h * 0.5f, label, nullptr);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+    }  
 
     // Map linear level to 0..1 across a -60 dB .. 0 dB range.
     static float levelToFraction(float level)
