@@ -8,16 +8,22 @@
 #include <cctype>
 #include <cstring>
 #include <string>
+#include <cstdlib>
+#include <vector>
+#include <dirent.h>
 
 START_NAMESPACE_DISTRHO
 
 using DGL_NAMESPACE::Color;
 
+static const float kListTop = 258.0f; // y of the first row
+static const float kRowH    = 18.0f;
+
 class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(400, 390),
+    : UI(400, 580),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -27,7 +33,9 @@ public:
 #if !DISTRHO_PLUGIN_TARGET_LV2
     Plugin* const plugin = static_cast<Plugin*>(getPluginInstancePointer());
     fMidiMonitor = dynamic_cast<MidiMonitorPlugin*>(plugin);
-#endif    
+#endif
+
+    scanSamples();
   }
 
 protected:
@@ -58,6 +66,20 @@ protected:
             repaint();
         }
 
+        // File list: click to select a row.
+        if (x >= 20 && x <= getWidth() - 20 && y >= kListTop && y < listBottom())
+        {
+            const int row = static_cast<int>((y - kListTop) / kRowH);
+            const int idx = fFirstRow + row;
+
+            if (row < visibleRows() && idx < static_cast<int>(fFiles.size()))
+            {
+                fSelected = fFiles[idx];
+                repaint();
+            }
+            return true;
+        }	
+
         // Buttons.
         const double by = getHeight() - 108.0;
 
@@ -82,6 +104,29 @@ protected:
 
         return false;
     }
+
+    bool onScroll(const ScrollEvent& ev) override
+    {
+        const double x = ev.pos.getX();
+        const double y = ev.pos.getY();
+
+        if (x < 20 || x > getWidth() - 20 || y < kListTop || y > listBottom())
+            return false;
+
+        // Accumulate so smooth trackpad deltas and wheel notches both behave.
+        fScrollAcc -= ev.delta.getY() * 2.0f; // rows per wheel notch
+        const int steps = static_cast<int>(fScrollAcc);
+
+        if (steps != 0)
+        {
+            fScrollAcc -= static_cast<float>(steps);
+            fFirstRow += steps;
+            clampScroll();
+            repaint();
+        }
+
+        return true;
+    }  
 
       bool onKeyboard(const KeyboardEvent& ev) override
     {
@@ -132,6 +177,14 @@ protected:
   
     void uiIdle() override
     {
+
+      // Rescan the samples folder roughly once a second.
+        if (++fScanTick >= 60)
+        {
+            fScanTick = 0;
+            scanSamples();
+        }
+      
         if (fMidiMonitor == nullptr)
             return;
 
@@ -240,6 +293,8 @@ protected:
             }
         }
 
+	drawFileList(width);
+
         drawTextField(20, height - 148.0f, width - 40.0f, 24.0f);	
 
         const float by = height - 108.0f;
@@ -276,6 +331,11 @@ protected:
             fName = value;
             repaint();
         }
+        else if (std::strcmp(key, "folder") == 0)
+        {
+            fFolder = value;
+            scanSamples();
+        }
     }
 
 private:
@@ -292,6 +352,149 @@ private:
 
     std::string fName { "sample" };
     bool fEditing = false;
+
+    std::vector<std::string> fFiles;
+    std::string fSelected;
+    std::string fFolder;
+    int   fFirstRow  = 0;
+    float fScrollAcc = 0.0f;
+    int   fScanTick  = 0;
+
+    float listBottom() const { return getHeight() - 160.0f; }
+
+    int visibleRows() const
+    {
+        return std::max(1, static_cast<int>((listBottom() - kListTop) / kRowH));
+    }
+
+    void clampScroll()
+    {
+        const int maxFirst = std::max(0, static_cast<int>(fFiles.size()) - visibleRows());
+        fFirstRow = std::min(std::max(fFirstRow, 0), maxFirst);
+    }
+
+    // Same default as the plugin's saveRecording().
+    std::string samplesFolder() const
+    {
+        if (!fFolder.empty())
+            return fFolder;
+
+        const char* home = std::getenv("HOME");
+        if (home == nullptr) home = std::getenv("USERPROFILE");
+        return std::string(home ? home : ".") + "/Samples";
+    }
+
+    static bool hasWavExtension(const std::string& n)
+    {
+        if (n.size() < 5)
+            return false;
+
+        std::string ext = n.substr(n.size() - 4);
+        for (char& c : ext)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        return ext == ".wav";
+    }
+
+    void scanSamples()
+    {
+        std::vector<std::string> found;
+
+        if (DIR* const dir = opendir(samplesFolder().c_str()))
+        {
+            while (const dirent* const e = readdir(dir))
+            {
+                const std::string n = e->d_name;
+                if (hasWavExtension(n))
+                    found.push_back(n);
+            }
+            closedir(dir);
+        }
+
+        std::sort(found.begin(), found.end());
+
+        if (found != fFiles)
+        {
+            fFiles.swap(found);
+            clampScroll();
+            repaint();
+        }
+    }
+
+    void drawFileList(float width)
+    {
+        clampScroll(); // the window may have been resized
+
+        const float x = 20.0f;
+        const float w = width - 40.0f;
+        const float h = listBottom() - kListTop;
+        const int   rows = visibleRows();
+        const int   count = static_cast<int>(fFiles.size());
+
+        // Header and file count.
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%d files", count);
+
+        fontSize(14.0f);
+        fillColor(Color(100, 220, 140));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x, kListTop - 18.0f, "SAMPLES", nullptr);
+
+        fontSize(12.0f);
+        fillColor(Color(140, 140, 150));
+        textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
+        text(x + w, kListTop - 18.0f, buf, nullptr);
+
+        // Panel.
+        beginPath();
+        roundedRect(x, kListTop, w, h, 4.0f);
+        fillColor(Color(40, 40, 46));
+        fill();
+
+        fontSize(13.0f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+
+        if (count == 0)
+        {
+            fillColor(Color(140, 140, 150));
+            text(x + 8.0f, kListTop + kRowH * 0.5f, "No .wav files found", nullptr);
+            return;
+        }
+
+        // Rows.
+        for (int i = 0; i < rows; ++i)
+        {
+            const int idx = fFirstRow + i;
+            if (idx >= count)
+                break;
+
+            const float ry = kListTop + i * kRowH;
+
+            if (fFiles[idx] == fSelected)
+            {
+                beginPath();
+                rect(x + 2.0f, ry, w - 12.0f, kRowH);
+                fillColor(Color(55, 105, 75));
+                fill();
+            }
+
+            fillColor(Color(220, 220, 225));
+            text(x + 8.0f, ry + kRowH * 0.5f, fFiles[idx].c_str(), nullptr);
+        }
+
+        // Scrollbar thumb, only when the list overflows.
+        if (count > rows)
+        {
+            const float thumbH = std::max(12.0f, h * rows / count);
+            const float travel = h - thumbH;
+            const float thumbY = kListTop + travel * fFirstRow / (count - rows);
+
+            beginPath();
+            roundedRect(x + w - 7.0f, thumbY, 4.0f, thumbH, 2.0f);
+            fillColor(Color(110, 110, 125));
+            fill();
+        }
+    }  
 
     void commitName()
     {
