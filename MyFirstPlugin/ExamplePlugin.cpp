@@ -235,21 +235,6 @@ protected:
 	   uint32_t midiEventCount) override  
     {
 
-      /*      if (midiEventCount > 0) {
-		std::printf("Received %u MIDI events\n", midiEventCount);
-
-	for (uint32_t i = 0; i < midiEventCount; ++i) {
-	  const MidiEvent& ev = midiEvents[i];
-
-	  std::printf("MIDI: size=%u", ev.size);
-
-	  for (uint32_t j = 0; j < ev.size; ++j)
-            std::printf(" %02X", ev.data[j]);
-
-	  std::printf("\n");
-	}
-	} */
-
       // Capture incoming MIDI note events.
       for (uint32_t i = 0; i < midiEventCount; ++i)
         {
@@ -316,6 +301,21 @@ protected:
 
         if (outputs[1] != inputs[1])
             std::memcpy(outputs[1], inputs[1], sizeof(float)*frames);
+
+        // Mix the sine voice on top of the passthrough audio,
+        // splitting the block at each MIDI event for sample-accurate timing.
+        uint32_t pos = 0;
+
+        for (uint32_t i = 0; i < midiEventCount; ++i)
+        {
+            const uint32_t frame = midiEvents[i].frame < frames ? midiEvents[i].frame : frames;
+
+            renderSine(outputs, pos, frame);
+            handleNote(midiEvents[i]);
+            pos = frame;
+        }
+
+        renderSine(outputs, pos, frames);	
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -338,6 +338,59 @@ private:
 
     std::atomic<uint32_t> fMidiHead { 0 };
     std::atomic<uint32_t> fMidiTail { 0 };
+
+    // Sine voice state (audio thread only)
+    double fPhase     = 0.0;
+    float  fFreq      = 440.0f;
+    float  fTargetAmp = 0.0f;
+    float  fEnv       = 0.0f;
+    int    fNote      = -1;
+
+    void handleNote(const MidiEvent& ev) noexcept
+    {
+        if (ev.size < 3)
+            return;
+
+        const uint8_t status = ev.data[0] & 0xF0;
+        const uint8_t note   = ev.data[1];
+        const uint8_t vel    = ev.data[2];
+
+        if (status == 0x90 && vel > 0)
+        {
+            fNote      = note;
+            fFreq      = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+            fTargetAmp = (vel / 127.0f) * 0.25f;
+        }
+        else if (status == 0x80 || (status == 0x90 && vel == 0))
+        {
+            // only release if it's the note currently sounding
+            if (note == fNote)
+            {
+                fNote      = -1;
+                fTargetAmp = 0.0f;
+            }
+        }
+    }
+
+    void renderSine(float** outputs, uint32_t start, uint32_t end) noexcept
+    {
+        const double inc = fFreq / getSampleRate();
+
+        for (uint32_t i = start; i < end; ++i)
+        {
+            // one-pole smoothing for attack/release
+            fEnv += (fTargetAmp - fEnv) * 0.002f;
+
+            const float s = static_cast<float>(std::sin(fPhase * 2.0 * M_PI)) * fEnv;
+
+            fPhase += inc;
+            if (fPhase >= 1.0)
+                fPhase -= 1.0;
+
+            outputs[0][i] += s;
+            outputs[1][i] += s;
+        }
+    }  
 
     void pushMidiEvent(const MidiMonitorEvent& event) noexcept
     {
