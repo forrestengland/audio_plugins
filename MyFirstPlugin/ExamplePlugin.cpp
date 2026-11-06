@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 START_NAMESPACE_DISTRHO
 
@@ -35,8 +36,7 @@ public:
         : MidiMonitorPlugin(3, 0, 0), // 3 parameters, 0 programs, 0 states
           fColor(0.0f),
           fOutLeft(0.0f),
-          fOutRight(0.0f),
-          fNeedsReset(true)
+          fOutRight(0.0f)
     {
     }
   
@@ -211,17 +211,6 @@ protected:
         fColor = value;
     }
 
-   /**
-      Change an internal state.
-    */
-    void setState(const char* key, const char*) override
-    {
-        if (std::strcmp(key, "reset") != 0)
-            return;
-
-        fNeedsReset = true;
-    }
-
    /* --------------------------------------------------------------------------------------------------------
     * Process */
 
@@ -281,19 +270,12 @@ protected:
         if (tmpRight > 1.0f)
             tmpRight = 1.0f;
 
-        if (fNeedsReset)
-        {
-            fOutLeft  = tmpLeft;
-            fOutRight = tmpRight;
-            fNeedsReset = false;
-        }
-        else
-        {
-            if (tmpLeft > fOutLeft)
-                fOutLeft = tmpLeft;
-            if (tmpRight > fOutRight)
-                fOutRight = tmpRight;
-        }
+	        // Peak with ~300 ms decay so the bar falls back down.
+        const float decay = std::exp(-static_cast<float>(frames)
+                                     / (static_cast<float>(getSampleRate()) * 0.3f));
+
+        fOutLeft  = std::max(tmpLeft,  fOutLeft  * decay);
+        fOutRight = std::max(tmpRight, fOutRight * decay);
 
         // copy inputs over outputs if needed
         if (outputs[0] != inputs[0])
@@ -330,7 +312,6 @@ private:
       Boolean used to reset meter values.
       The UI will send a "reset" message which sets this as true.
     */
-    volatile bool fNeedsReset;
 
     static constexpr uint32_t MIDI_BUFFER_SIZE = 64;
 
