@@ -1,18 +1,4 @@
-/*
- * DISTRHO Plugin Framework (DPF)
- * Copyright (C) 2012-2024 Filipe Coelho <falktx@falktx.com>
- *
- * Permission to use, copy, modify, and/or distribute this software for any purpose with
- * or without fee is hereby granted, provided that the above copyright notice and this
- * permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD
- * TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN
- * NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
- * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER
- * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
+// ensoniq mirage inspired sampler dpf plugin by Forrest England 2026
 
 #include "DistrhoPlugin.hpp"
 #include "MidiMonitor.hpp"
@@ -25,6 +11,7 @@
 #include <string>
 #include <cstdlib>
 #include <cctype>
+#include <thread>
 
 #ifdef _WIN32
  #include <direct.h>
@@ -45,7 +32,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(4, 0, 3), // 3 parameters, 0 programs, 0 states
+        : MidiMonitorPlugin(5, 0, 4), // 3 parameters, 0 programs, 0 states
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -191,6 +178,13 @@ protected:
             parameter.name   = "record";
             parameter.symbol = "record";
             break;
+        case 4:
+            parameter.hints  = kParameterIsOutput;
+            parameter.name   = "sample-length";
+            parameter.symbol = "sample_length";
+            parameter.unit   = "s";
+            parameter.ranges.max = 3600.0f;
+            break;	    
         }
     }
 
@@ -205,6 +199,7 @@ protected:
         case 0: key = "name";   defaultValue = "sample"; break;
         case 1: key = "folder"; defaultValue = "";       break;
         case 2: key = "save";   defaultValue = "";       break;
+	case 3: key = "load"; defaultValue = ""; break;
         }
     }  
 
@@ -221,7 +216,8 @@ protected:
         case 0: return fColor;
         case 1: return fOutLeft;
         case 2: return fOutRight;
-        case 3: return fRecording.load() ? 1.0f : 0.0f;	  
+        case 3: return fRecording.load() ? 1.0f : 0.0f;
+	case 4: return fSampSeconds.load();
         }
 
         return 0.0f;
@@ -247,6 +243,8 @@ protected:
             fFolder = value;
         else if (std::strcmp(key, "save") == 0)
             saveRecording();
+	else if (std::strcmp(key, "load") == 0)
+	  loadSample(value);
     }  
 
    /* --------------------------------------------------------------------------------------------------------
@@ -342,20 +340,34 @@ protected:
         if (outputs[1] != inputs[1])
             std::memcpy(outputs[1], inputs[1], sizeof(float)*frames);
 
-        // Mix the sine voice on top of the passthrough audio,
-        // splitting the block at each MIDI event for sample-accurate timing.
+        // Try to take the sample lock; if the loader has it, skip samples this block.
+        const bool haveLock = trySampleLock();
+
+        if (haveLock && fKillVoices.exchange(false, std::memory_order_acq_rel))
+        {
+            // a new sample was swapped in: stop voices that pointed at the old one
+            for (SampleVoice& v : fVoices)
+                v.active = false;
+
+            fNote      = -1;
+            fTargetAmp = 0.0f;
+        }
+
         uint32_t pos = 0;
 
         for (uint32_t i = 0; i < midiEventCount; ++i)
         {
             const uint32_t frame = midiEvents[i].frame < frames ? midiEvents[i].frame : frames;
 
-            renderSine(outputs, pos, frame);
-            handleNote(midiEvents[i]);
+            renderAudio(outputs, pos, frame, haveLock);
+            handleNote(midiEvents[i], haveLock);
             pos = frame;
         }
 
-        renderSine(outputs, pos, frames);	
+        renderAudio(outputs, pos, frames, haveLock);
+
+        if (haveLock)
+            sampleUnlock();	
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -395,6 +407,296 @@ private:
     std::string fName { "sample" };
     std::string fFolder;
 
+    // ---- Sample memory (guarded by fSampBusy) ----
+    std::vector<float> fSampL, fSampR;
+    uint32_t fSampLen  = 0;
+    uint32_t fSampRate = 44100;
+
+    std::atomic<bool>  fSampBusy    { false };
+    std::atomic<bool>  fHasSample   { false };
+    std::atomic<bool>  fKillVoices  { false };
+    std::atomic<float> fSampSeconds { 0.0f };
+
+    // ---- Voices (audio thread only) ----
+    static constexpr uint32_t kNumVoices = 8;
+    static constexpr int      kRootNote  = 60; // C4 plays at original pitch
+
+    struct SampleVoice
+    {
+        bool   active    = false;
+        bool   releasing = false;
+        int    note      = -1;
+        double pos       = 0.0;
+        double step      = 0.0;
+        float  gain      = 0.0f;
+        float  env       = 0.0f;
+    };
+
+    SampleVoice fVoices[kNumVoices];
+    uint32_t    fNextVoice = 0;
+
+    bool trySampleLock() noexcept { return !fSampBusy.exchange(true, std::memory_order_acquire); }
+    void sampleUnlock()  noexcept { fSampBusy.store(false, std::memory_order_release); }
+
+    void lockSample() // loader thread only
+    {
+        while (fSampBusy.exchange(true, std::memory_order_acquire))
+            std::this_thread::yield();
+    }
+
+    void startVoice(uint8_t note, uint8_t vel) noexcept
+    {
+        SampleVoice* v = nullptr;
+
+        for (SampleVoice& c : fVoices)
+            if (!c.active) { v = &c; break; }
+
+        const bool stolen = (v == nullptr);
+        if (stolen)
+        {
+            v = &fVoices[fNextVoice];
+            fNextVoice = (fNextVoice + 1) % kNumVoices;
+        }
+
+        v->active    = true;
+        v->releasing = false;
+        v->note      = note;
+        v->pos       = 0.0;
+        v->step      = std::pow(2.0, (note - kRootNote) / 12.0)
+                     * static_cast<double>(fSampRate) / getSampleRate();
+        v->gain      = (vel / 127.0f) * 0.5f;
+        if (!stolen)
+            v->env   = 0.0f; // a stolen voice keeps its envelope to avoid a click
+    }
+
+    void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
+    {
+        if (fSampLen < 2)
+            return;
+
+        const float* const L = fSampL.data();
+        const float* const R = fSampR.data();
+        const double lastPos = static_cast<double>(fSampLen - 1);
+
+        for (SampleVoice& v : fVoices)
+        {
+            if (!v.active)
+                continue;
+
+            const float target = v.releasing ? 0.0f : 1.0f;
+
+            for (uint32_t i = start; i < end; ++i)
+            {
+                v.env += (target - v.env) * 0.01f;
+
+                if (v.pos >= lastPos || (v.releasing && v.env < 0.0005f))
+                {
+                    v.active = false;
+                    break;
+                }
+
+                const uint32_t idx  = static_cast<uint32_t>(v.pos);
+                const float    frac = static_cast<float>(v.pos - idx);
+                const float    amp  = v.env * v.gain;
+
+                // linear interpolation
+                outputs[0][i] += (L[idx] + (L[idx + 1] - L[idx]) * frac) * amp;
+                outputs[1][i] += (R[idx] + (R[idx + 1] - R[idx]) * frac) * amp;
+
+                v.pos += v.step;
+            }
+        }
+    }
+
+    void renderAudio(float** outputs, uint32_t start, uint32_t end, bool haveLock) noexcept
+    {
+        renderSine(outputs, start, end);
+
+        if (haveLock)
+            renderSamples(outputs, start, end);
+    }
+
+    std::string samplesFolder() const
+    {
+        if (!fFolder.empty())
+            return fFolder;
+
+        const char* home = std::getenv("HOME");
+        if (home == nullptr) home = std::getenv("USERPROFILE");
+        return std::string(home ? home : ".") + "/Samples";
+    }
+
+    // Reads 8/16/24/32-bit PCM or 32-bit float WAV. Mono is duplicated to both channels.
+    static bool readWav(const std::string& path,
+                        std::vector<float>& outL, std::vector<float>& outR,
+                        uint32_t& outRate)
+    {
+        std::FILE* const f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr)
+            return false;
+
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+
+        if (size < 44 || size > 64L * 1024 * 1024)
+        {
+            std::fclose(f);
+            return false;
+        }
+
+        std::vector<uint8_t> d(static_cast<size_t>(size));
+        const size_t got = std::fread(d.data(), 1, d.size(), f);
+        std::fclose(f);
+
+        if (got != d.size())
+            return false;
+
+        auto rd16 = [&d](size_t o) -> uint32_t
+        {
+            return uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8);
+        };
+        auto rd32 = [&d](size_t o) -> uint32_t
+        {
+            return uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8)
+                 | (uint32_t(d[o + 2]) << 16) | (uint32_t(d[o + 3]) << 24);
+        };
+
+        if (std::memcmp(&d[0], "RIFF", 4) != 0 || std::memcmp(&d[8], "WAVE", 4) != 0)
+            return false;
+
+        uint32_t format = 0, channels = 0, bits = 0, rate = 0;
+        size_t   dataOff = 0, dataSize = 0;
+        bool     haveFmt = false, haveData = false;
+
+        size_t p = 12;
+        while (p + 8 <= d.size())
+        {
+            const uint32_t csize = rd32(p + 4);
+            const size_t   body  = p + 8;
+
+            if (std::memcmp(&d[p], "fmt ", 4) == 0 && csize >= 16 && body + 16 <= d.size())
+            {
+                format   = rd16(body);
+                channels = rd16(body + 2);
+                rate     = rd32(body + 4);
+                bits     = rd16(body + 14);
+
+                // WAVE_FORMAT_EXTENSIBLE: the real format tag is in the sub-format
+                if (format == 0xFFFE && csize >= 26 && body + 26 <= d.size())
+                    format = rd16(body + 24);
+
+                haveFmt = true;
+            }
+            else if (std::memcmp(&d[p], "data", 4) == 0)
+            {
+                dataOff  = body;
+                dataSize = std::min<size_t>(csize, d.size() - body);
+                haveData = true;
+                break;
+            }
+
+            const uint64_t next = uint64_t(body) + csize + (csize & 1u);
+            if (next >= d.size())
+                break;
+            p = static_cast<size_t>(next);
+        }
+
+        const bool okFormat = (format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32))
+                           || (format == 3 && bits == 32);
+
+        if (!haveFmt || !haveData || !okFormat || channels < 1 || rate == 0)
+            return false;
+
+        const size_t bytes      = bits / 8;
+        const size_t frameBytes = bytes * channels;
+        const size_t frames     = dataSize / frameBytes;
+
+        if (frames < 2)
+            return false;
+
+        auto sampleAt = [&](size_t o) -> float
+        {
+            switch (bits)
+            {
+            case 8:
+                return (static_cast<int>(d[o]) - 128) / 128.0f;
+            case 16:
+                return static_cast<int16_t>(rd16(o)) / 32768.0f;
+            case 24:
+            {
+                int32_t v = static_cast<int32_t>(uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8)
+                                               | (uint32_t(d[o + 2]) << 16));
+                if (v & 0x800000)
+                    v -= 0x1000000;
+                return v / 8388608.0f;
+            }
+            case 32:
+                if (format == 3)
+                {
+                    const uint32_t u = rd32(o);
+                    float x;
+                    std::memcpy(&x, &u, 4);
+                    return x;
+                }
+                return static_cast<int32_t>(rd32(o)) / 2147483648.0f;
+            }
+            return 0.0f;
+        };
+
+        outL.assign(frames, 0.0f);
+        outR.assign(frames, 0.0f);
+
+        for (size_t i = 0; i < frames; ++i)
+        {
+            const size_t o = dataOff + i * frameBytes;
+            const float  l = sampleAt(o);
+            outL[i] = l;
+            outR[i] = (channels > 1) ? sampleAt(o + bytes) : l;
+        }
+
+        outRate = rate;
+        return true;
+    }
+
+    // Called from setState(), which is not the audio thread.
+    void loadSample(const char* name)
+    {
+        const std::string n = name;
+
+        // ignore empty names (default state replay) and anything that tries to leave the folder
+        if (n.empty() || n.find('/') != std::string::npos
+                      || n.find('\\') != std::string::npos
+                      || n.find("..") != std::string::npos)
+            return;
+
+        const std::string path = samplesFolder() + "/" + n;
+
+        std::vector<float> L, R;
+        uint32_t rate = 0;
+
+        if (!readWav(path, L, R, rate))
+        {
+            std::printf("Could not load %s\n", path.c_str());
+            return;
+        }
+
+        const uint32_t len = static_cast<uint32_t>(L.size());
+
+        lockSample();
+        fSampL.swap(L);
+        fSampR.swap(R);
+        fSampLen  = len;
+        fSampRate = rate;
+        fHasSample.store(true, std::memory_order_relaxed);
+        fKillVoices.store(true, std::memory_order_release);
+        sampleUnlock();
+        // the old buffers are freed here, outside the lock
+
+        fSampSeconds.store(static_cast<float>(len) / static_cast<float>(rate));
+        std::printf("Loaded %s (%u frames @ %u Hz)\n", path.c_str(), len, rate);
+    }  
+
     static void writeLE(std::FILE* f, uint32_t v, int bytes)
     {
         for (int i = 0; i < bytes; ++i)
@@ -418,14 +720,7 @@ private:
         if (len == 0 || fRecording.load())
             return;
 
-        std::string folder = fFolder;
-        if (folder.empty())
-        {
-            const char* home = std::getenv("HOME");
-            if (home == nullptr) home = std::getenv("USERPROFILE");
-            folder = std::string(home ? home : ".") + "/Samples";
-        }
-        MKDIR(folder.c_str()); // fine if it already exists
+	const std::string folder = samplesFolder();
 
         // Don't overwrite: name.wav, name_2.wav, ...
         const std::string base = folder + "/" + sanitize(fName);
@@ -471,7 +766,7 @@ private:
         std::printf("Saved %s (%u frames)\n", path.c_str(), len);
     }  
 
-    void handleNote(const MidiEvent& ev) noexcept
+    void handleNote(const MidiEvent& ev, bool haveLock) noexcept
     {
         if (ev.size < 3)
             return;
@@ -480,22 +775,37 @@ private:
         const uint8_t note   = ev.data[1];
         const uint8_t vel    = ev.data[2];
 
-        if (status == 0x90 && vel > 0)
+        const bool noteOn  = status == 0x90 && vel > 0;
+        const bool noteOff = status == 0x80 || (status == 0x90 && vel == 0);
+
+        if (noteOn)
         {
-            fNote      = note;
-            fFreq      = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
-            fTargetAmp = (vel / 127.0f) * 0.25f;
+            if (fHasSample.load(std::memory_order_relaxed))
+            {
+                if (haveLock)
+                    startVoice(note, vel);
+            }
+            else
+            {
+                // no sample loaded: sine fallback
+                fNote      = note;
+                fFreq      = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+                fTargetAmp = (vel / 127.0f) * 0.25f;
+            }
         }
-        else if (status == 0x80 || (status == 0x90 && vel == 0))
+        else if (noteOff)
         {
-            // only release if it's the note currently sounding
+            for (SampleVoice& v : fVoices)
+                if (v.active && v.note == note)
+                    v.releasing = true;
+
             if (note == fNote)
             {
                 fNote      = -1;
                 fTargetAmp = 0.0f;
             }
         }
-    }
+    }  
 
     void renderSine(float** outputs, uint32_t start, uint32_t end) noexcept
     {

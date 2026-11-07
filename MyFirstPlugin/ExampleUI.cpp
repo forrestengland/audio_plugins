@@ -102,6 +102,13 @@ protected:
             return true;
         }
 
+        if (x >= 240 && x <= 340)
+        {
+            if (!fSelected.empty())
+                setState("load", fSelected.c_str());
+            return true;
+        }	
+
         return false;
     }
 
@@ -300,7 +307,10 @@ protected:
         const float by = height - 108.0f;
         drawButton(fRecording ? "STOP" : "REC", 20, by, 100, 24,
                    fRecording ? Color(200, 60, 60) : Color(70, 70, 80));
-        drawButton("SAVE", 130, by, 100, 24, Color(70, 70, 80));	
+        drawButton("SAVE", 130, by, 100, 24, Color(70, 70, 80));
+
+        drawButton("LOAD", 240, by, 100, 24,
+                   fSelected.empty() ? Color(55, 55, 62) : Color(70, 70, 80));	
 
 	// Level meters, anchored to the bottom of the window.
         fontSize(12.0f);
@@ -319,6 +329,7 @@ protected:
         case 1: fLevelL = value; break;
         case 2: fLevelR = value; break;
 	case 3: fRecording = value > 0.5f; break;
+	case 4: fSampSec = value; break;
         }
 
         repaint();
@@ -359,6 +370,8 @@ private:
     int   fFirstRow  = 0;
     float fScrollAcc = 0.0f;
     int   fScanTick  = 0;
+
+    float fSampSec = 0.0f;  
 
     float listBottom() const { return getHeight() - 160.0f; }
 
@@ -444,6 +457,15 @@ private:
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
         text(x + w, kListTop - 18.0f, buf, nullptr);
+
+        char mem[40];
+        if (fSampSec > 0.0f)
+            std::snprintf(mem, sizeof(mem), "MEM %.2f s", fSampSec);
+        else
+            std::snprintf(mem, sizeof(mem), "MEM empty");
+
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x + 90.0f, kListTop - 18.0f, mem, nullptr);	
 
         // Panel.
         beginPath();
