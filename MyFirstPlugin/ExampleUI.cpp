@@ -51,6 +51,23 @@ static const uint32_t kFilterParam = 197;
 static const float kSliderX = 950.0f;  // kCol3X + 130
 static const float kSliderW = 150.0f;
 
+static const uint32_t kEnvParam = 229;
+
+// times: 1 ms .. 10 s, log scale
+static float timeToFrac(float t)
+{
+    t = std::min(10.0f, std::max(0.001f, t));
+    return std::log(t / 0.001f) / std::log(10000.0f);
+}
+static float fracToTime(float f) { return 0.001f * std::pow(10000.0f, f); }
+
+static void fmtTime(float t, char* buf, size_t n)
+{
+    if (t < 0.01f)      std::snprintf(buf, n, "%.1f ms", t * 1000.0f);
+    else if (t < 1.0f)  std::snprintf(buf, n, "%.0f ms", t * 1000.0f);
+    else                std::snprintf(buf, n, "%.2f s", t);
+}
+
 static float cutoffToFrac(float hz)
 {
     hz = std::min(20000.0f, std::max(20.0f, hz));
@@ -198,9 +215,9 @@ protected:
             if (y >= iy && y <= iy + 24.0 && x >= kCol3X + 130.0)
                 toggleInterp();
 
-            for (int k = 0; k < 2; ++k)
+            for (int k = 0; k < 6; ++k)
             {
-                const double ry = col3RowY(k + 1);
+                const double ry = col3RowY(sliderRow(k));
                 if (y >= ry && y <= ry + 24.0 && x >= kSliderX - 8.0 && x <= kSliderX + kSliderW + 8.0)
                 {
                     fDragSlider = k;
@@ -640,6 +657,28 @@ protected:
             drawSlider("RESONANCE", col3RowY(2), s.res, vb);
         }
 
+        // Rows 5-8: amplitude envelope.
+        {
+            fontSize(14.0f);
+            fillColor(Color(100, 220, 140));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kCol3X, col3RowY(4) + 12.0f, "AMP ENVELOPE", nullptr);
+
+            char vb[24];
+
+            fmtTime(s.att, vb, sizeof(vb));
+            drawSlider("ATTACK",  col3RowY(5), timeToFrac(s.att), vb);
+
+            fmtTime(s.dec, vb, sizeof(vb));
+            drawSlider("DECAY",   col3RowY(6), timeToFrac(s.dec), vb);
+
+            std::snprintf(vb, sizeof(vb), "%.0f%%", s.sus * 100.0f);
+            drawSlider("SUSTAIN", col3RowY(7), s.sus, vb);
+
+            fmtTime(s.rel, vb, sizeof(vb));
+            drawSlider("RELEASE", col3RowY(8), timeToFrac(s.rel), vb);
+        }	
+
         fontSize(11.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
@@ -767,6 +806,22 @@ protected:
             repaint();
             return;
         }
+
+        if (index >= kEnvParam)
+        {
+            const uint32_t g = (index - kEnvParam) / 16;
+            const uint32_t s = (index - kEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlot[s].att = value; break;
+            case 1: fSlot[s].dec = value; break;
+            case 2: fSlot[s].sus = value; break;
+            case 3: fSlot[s].rel = value; break;
+            }
+            repaint();
+            return;
+        }      
 
         if (index >= kFilterParam)
         {
@@ -911,7 +966,8 @@ private:
     float endPt = 1.0f, loopStart = 0.0f, loopEnd = 1.0f;
     bool  loopOn = false;
     bool interp = true;
-    float cutoff = 20000.0f, res = 0.0f;      
+    float cutoff = 20000.0f, res = 0.0f;
+    float att = 0.002f, dec = 0.1f, sus = 1.0f, rel = 0.005f;
   };
 
     SlotInfo fSlot[16];
@@ -925,26 +981,35 @@ private:
 
     int fDragSlider = -1; // -1 none, 0 cutoff, 1 resonance
 
-    uint32_t sliderParam(int which) const { return kFilterParam + which * 16 + fSel; }
+    uint32_t sliderParam(int which) const
+    {
+        return which < 2 ? kFilterParam + which * 16 + fSel
+                         : kEnvParam + (which - 2) * 16 + fSel;
+    }
+
+    static int sliderRow(int which) { return which < 2 ? which + 1 : which + 3; }
 
     void setSliderFromX(double x)
     {
         const float f = std::min(1.0f, std::max(0.0f,
                             (static_cast<float>(x) - kSliderX) / kSliderW));
         SlotInfo& s = fSlot[fSel];
+        float v = 0.0f;
 
-        if (fDragSlider == 0)
+        switch (fDragSlider)
         {
-            s.cutoff = (f >= 0.99f) ? 20000.0f : fracToCutoff(f); // snap fully open
-            setParameterValue(sliderParam(0), s.cutoff);
+        case 0: v = s.cutoff = (f >= 0.99f) ? 20000.0f : fracToCutoff(f); break;
+        case 1: v = s.res    = f;                                         break;
+        case 2: v = s.att    = fracToTime(f);                             break;
+        case 3: v = s.dec    = fracToTime(f);                             break;
+        case 4: v = s.sus    = f;                                         break;
+        case 5: v = s.rel    = fracToTime(f);                             break;
+        default: return;
         }
-        else if (fDragSlider == 1)
-        {
-            s.res = f;
-            setParameterValue(sliderParam(1), s.res);
-        }
+
+        setParameterValue(sliderParam(fDragSlider), v);
         repaint();
-    }
+    }  
 
     void drawSlider(const char* label, float y, float frac, const char* value)
     {

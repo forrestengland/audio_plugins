@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(229, 0, 19),
+        : MidiMonitorPlugin(293, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,36 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kEnvParam)
+        {
+            static const char* const names[] = { "attack", "decay", "sustain", "release" };
+
+            const uint32_t g = (index - kEnvParam) / 16;
+            const uint32_t s = (index - kEnvParam) % 16;
+            if (g > 3) return;
+
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, names[g]);
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, names[g]);
+            parameter.name   = name;
+            parameter.symbol = sym;
+
+            if (g == 2)
+            {
+                parameter.hints      = kParameterIsAutomatable;
+                parameter.ranges.def = 1.0f;
+            }
+            else
+            {
+                parameter.hints      = kParameterIsAutomatable|kParameterIsLogarithmic;
+                parameter.unit       = "s";
+                parameter.ranges.min = 0.001f;
+                parameter.ranges.max = 10.0f;
+                parameter.ranges.def = (g == 0) ? 0.002f : (g == 1) ? 0.1f : 0.005f;
+            }
+            return;
+        }	
 
         if (index >= kFilterParam)
         {
@@ -352,6 +382,21 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+        if (index >= kEnvParam)
+        {
+            const uint32_t g = (index - kEnvParam) / 16;
+            const uint32_t s = (index - kEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: return fSlots[s].attack.load();
+            case 1: return fSlots[s].decay.load();
+            case 2: return fSlots[s].sustain.load();
+            case 3: return fSlots[s].release.load();
+            }
+            return 0.0f;
+        }	
+
         if (index >= kFilterParam)
         {
             const uint32_t g = (index - kFilterParam) / 16;
@@ -424,6 +469,21 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kEnvParam)
+        {
+            const uint32_t g = (index - kEnvParam) / 16;
+            const uint32_t s = (index - kEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlots[s].attack.store(value);  break;
+            case 1: fSlots[s].decay.store(value);   break;
+            case 2: fSlots[s].sustain.store(value); break;
+            case 3: fSlots[s].release.store(value); break;
+            }
+            return;
+        }      
 
         if (index >= kFilterParam)
         {
@@ -711,7 +771,11 @@ private:
         std::atomic<bool>  loopOn    { false };
         std::atomic<bool> interp { true }; // true = linear, false = nearest sample
         std::atomic<float> cutoff { 20000.0f };
-        std::atomic<float> res    { 0.0f };      
+        std::atomic<float> res    { 0.0f };
+        std::atomic<float> attack  { 0.002f };
+        std::atomic<float> decay   { 0.1f };
+        std::atomic<float> sustain { 1.0f };
+        std::atomic<float> release { 0.005f };      
     };
 
     Slot fSlots[kNumSlots];
@@ -729,7 +793,8 @@ private:
         double step      = 0.0;
         float  gain      = 0.0f;
         float  env       = 0.0f;
-        float  ic1L = 0.0f, ic2L = 0.0f, ic1R = 0.0f, ic2R = 0.0f; // filter state      
+        float  ic1L = 0.0f, ic2L = 0.0f, ic1R = 0.0f, ic2R = 0.0f; // filter state
+      int stage = 0; // 0 attack, 1 decay, 2 sustain - 'releasing' above sets release stage
     };
 
     SampleVoice fVoices[kNumVoices];
@@ -741,7 +806,8 @@ private:
     static constexpr uint32_t kEndParam = 117; // 117..132 end, 133..148 loop start,
     static constexpr uint32_t kInterpParam = 181; // 181..196 = slot interpolation  
                                                // 149..164 loop end, 165..180 loop on
-    static constexpr uint32_t kFilterParam = 197; // 197..212 cutoff, 213..228 resonance  
+    static constexpr uint32_t kFilterParam = 197; // 197..212 cutoff, 213..228 resonance
+    static constexpr uint32_t kEnvParam = 229; // 229 attack, 245 decay, 261 sustain, 277 release  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -803,7 +869,8 @@ private:
         v->gain      = (vel / 127.0f) * 0.5f;
         if (!stolen)
             v->env   = 0.0f;
-        v->ic1L = v->ic2L = v->ic1R = v->ic2R = 0.0f;	
+        v->ic1L = v->ic2L = v->ic1R = v->ic2R = 0.0f;
+	v->stage = 0;
     }
     void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
     {
@@ -832,7 +899,12 @@ private:
             const bool looping = s.loopOn.load(std::memory_order_relaxed) && (le - ls) >= 2.0;
             const double loopLen = le - ls;
 
-            const float target   = v.releasing ? 0.0f : 1.0f;
+            // ADSR rates: attack and decay are linear, release is exponential (-60 dB over the release time)
+            const float envSr   = static_cast<float>(getSampleRate());
+            const float susLvl  = std::min(1.0f, std::max(0.0f, s.sustain.load(std::memory_order_relaxed)));
+            const float attInc  = 1.0f / (std::max(0.001f, s.attack.load(std::memory_order_relaxed)) * envSr);
+            const float decDec  = (1.0f - susLvl) / (std::max(0.001f, s.decay.load(std::memory_order_relaxed)) * envSr);
+            const float relCoef = std::exp(-6.9f / (std::max(0.001f, s.release.load(std::memory_order_relaxed)) * envSr));
             const float slotGain = s.gainLin.load(std::memory_order_relaxed);
 
             const float qs = s.bit8.load(std::memory_order_relaxed) ? 128.0f : 32768.0f;
@@ -863,13 +935,32 @@ private:
 	    
             for (uint32_t i = start; i < end; ++i)
             {
-                v.env += (target - v.env) * 0.01f;
+                if (v.releasing)
+                {
+                    v.env *= relCoef;
+                }
+                else if (v.stage == 0)
+                {
+                    v.env += attInc;
+                    if (v.env >= 1.0f) { v.env = 1.0f; v.stage = 1; }
+                }
+                else if (v.stage == 1)
+                {
+                    v.env -= decDec;
+                    if (v.env <= susLvl) { v.env = susLvl; v.stage = 2; }
+                }
+                else
+                {
+                    v.env = susLvl;
+                }
 
                 // wrap at the loop end; the loop end replaces the sample end while looping
                 if (looping && v.pos >= le)
                     v.pos = ls + std::fmod(v.pos - ls, loopLen);
 
-                if ((!looping && v.pos >= endPos) || (v.releasing && v.env < 0.0005f))
+                if ((!looping && v.pos >= endPos)
+		    || (v.releasing && v.env < 0.0005f)
+		    || (v.stage == 2 && susLvl < 0.0005f))
                 {
                     v.active = false;
                     break;
