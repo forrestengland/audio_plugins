@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(6, 0, 4),
+        : MidiMonitorPlugin(84, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -143,6 +143,47 @@ protected:
         parameter.ranges.max = 1.0f;
         parameter.ranges.def = 0.0f;
 
+        if (index >= 4)
+        {
+            static const char* const fieldNames[] = { "length", "root", "low", "high", "start" };
+
+            const uint32_t s = (index - 4) / 5;
+            const uint32_t f = (index - 4) % 5;
+
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, fieldNames[f]);
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, fieldNames[f]);
+            parameter.name   = name;
+            parameter.symbol = sym;
+
+            switch (f)
+            {
+            case 0:
+                parameter.hints      = kParameterIsOutput;
+                parameter.unit       = "s";
+                parameter.ranges.max = 3600.0f;
+                break;
+            case 1:
+                parameter.hints      = kParameterIsAutomatable|kParameterIsInteger;
+                parameter.ranges.max = 127.0f;
+                parameter.ranges.def = 60.0f;
+                break;
+            case 2:
+                parameter.hints      = kParameterIsAutomatable|kParameterIsInteger;
+                parameter.ranges.max = 127.0f;
+                break;
+            case 3:
+                parameter.hints      = kParameterIsAutomatable|kParameterIsInteger;
+                parameter.ranges.max = 127.0f;
+                parameter.ranges.def = 127.0f;
+                break;
+            case 4:
+                parameter.hints      = kParameterIsAutomatable;
+                break;
+            }
+            return;
+        }	
+
        /**
           Set parameter data.
         */
@@ -179,18 +220,6 @@ protected:
             parameter.name   = "record";
             parameter.symbol = "record";
             break;
-        case 4:
-            parameter.hints  = kParameterIsOutput;
-            parameter.name   = "sample-length";
-            parameter.symbol = "sample_length";
-            parameter.unit   = "s";
-            parameter.ranges.max = 3600.0f;
-            break;
-        case 5:
-            parameter.hints  = kParameterIsAutomatable;
-            parameter.name   = "sample-start";
-            parameter.symbol = "sample_start";
-            break;	    
         }
     }
 
@@ -200,12 +229,20 @@ protected:
     */
     void initState(uint32_t index, String& key, String& defaultValue) override
     {
+        defaultValue = "";
+
         switch (index)
         {
-        case 0: key = "name";   defaultValue = "sample"; break;
-        case 1: key = "folder"; defaultValue = "";       break;
-        case 2: key = "save";   defaultValue = "";       break;
-	case 3: key = "load"; defaultValue = ""; break;
+        case 0: key = "name";   break;
+        case 1: key = "folder"; break;
+        case 2: key = "save";   break;
+        default:
+        {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "slot%u", index - 2); // indices 3..18 -> slot1..slot16
+            key = buf;
+            break;
+        }
         }
     }  
 
@@ -217,14 +254,28 @@ protected:
     */
     float getParameterValue(uint32_t index) const override
     {
+        if (index >= 4)
+        {
+            const uint32_t s = (index - 4) / 5;
+            if (s >= kNumSlots) return 0.0f;
+
+            switch ((index - 4) % 5)
+            {
+            case 0: return fSlots[s].seconds.load();
+            case 1: return static_cast<float>(fSlots[s].root.load());
+            case 2: return static_cast<float>(fSlots[s].lo.load());
+            case 3: return static_cast<float>(fSlots[s].hi.load());
+            case 4: return fSlots[s].start.load();
+            }
+            return 0.0f;
+        }
+      
         switch (index)
         {
         case 0: return fColor;
         case 1: return fOutLeft;
         case 2: return fOutRight;
         case 3: return fRecording.load() ? 1.0f : 0.0f;
-	case 4: return fSampSeconds.load();
-	case 5: return fStart.load();
         }
 
         return 0.0f;
@@ -235,11 +286,25 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+        if (index >= 4)
+        {
+            const uint32_t s = (index - 4) / 5;
+            if (s >= kNumSlots) return;
+
+            switch ((index - 4) % 5)
+            {
+            case 1: fSlots[s].root.store(static_cast<int>(value + 0.5f)); break;
+            case 2: fSlots[s].lo.store(static_cast<int>(value + 0.5f));   break;
+            case 3: fSlots[s].hi.store(static_cast<int>(value + 0.5f));   break;
+            case 4: fSlots[s].start.store(value);                         break;
+            }
+            return;
+        }
+      
         switch (index)
         {
         case 0: fColor = value; break;
         case 3: fRecording.store(value > 0.5f); break;
-	case 5: fStart.store(value); break;
         }
     }
 
@@ -251,8 +316,12 @@ protected:
             fFolder = value;
         else if (std::strcmp(key, "save") == 0)
             saveRecording();
-	else if (std::strcmp(key, "load") == 0)
-	  loadSample(value);
+        else if (std::strncmp(key, "slot", 4) == 0)
+        {
+            const int n = std::atoi(key + 4);
+            if (n >= 1 && n <= static_cast<int>(kNumSlots))
+                loadSample(static_cast<uint32_t>(n - 1), value);
+        }	
     }  
 
    /* --------------------------------------------------------------------------------------------------------
@@ -351,14 +420,20 @@ protected:
         // Try to take the sample lock; if the loader has it, skip samples this block.
         const bool haveLock = trySampleLock();
 
-        if (haveLock && fKillVoices.exchange(false, std::memory_order_acq_rel))
+	        if (haveLock)
         {
-            // a new sample was swapped in: stop voices that pointed at the old one
-            for (SampleVoice& v : fVoices)
-                v.active = false;
+            // slots that were just replaced: stop voices still pointing at the old data
+            const uint32_t mask = fKillMask.exchange(0, std::memory_order_acq_rel);
 
-            fNote      = -1;
-            fTargetAmp = 0.0f;
+            if (mask != 0)
+            {
+                for (SampleVoice& v : fVoices)
+                    if (v.active && ((mask >> v.slot) & 1u))
+                        v.active = false;
+
+                fNote      = -1;
+                fTargetAmp = 0.0f;
+            }
         }
 
         uint32_t pos = 0;
@@ -416,26 +491,39 @@ private:
     std::string fFolder;
 
     // ---- Sample memory (guarded by fSampBusy) ----
-    std::vector<float> fSampL, fSampR;
-    uint32_t fSampLen  = 0;
-    uint32_t fSampRate = 44100;
 
     std::atomic<bool>  fSampBusy    { false };
-    std::atomic<bool>  fHasSample   { false };
-    std::atomic<bool>  fKillVoices  { false };
-    std::atomic<float> fSampSeconds { 0.0f };
 
     // ---- Voices (audio thread only) ----
     static constexpr uint32_t kNumVoices = 8;
     static constexpr int      kRootNote  = 60; // C4 plays at original pitch
 
-  std::atomic<float> fStart {0.0f};
+      static constexpr uint32_t kNumSlots = 16;
 
+    struct Slot
+    {
+        std::vector<float> L, R;       // guarded by fSampBusy
+        uint32_t len  = 0;
+        uint32_t rate = 44100;
+
+        std::atomic<int>   root    { 60 };
+        std::atomic<int>   lo      { 0 };
+        std::atomic<int>   hi      { 127 };
+        std::atomic<float> start   { 0.0f };
+        std::atomic<float> seconds { 0.0f };
+    };
+
+    Slot fSlots[kNumSlots];
+
+    std::atomic<bool>     fAnySample { false };
+    std::atomic<uint32_t> fKillMask  { 0 };   // bit n = slot n was just replaced
+  
     struct SampleVoice
     {
         bool   active    = false;
         bool   releasing = false;
         int    note      = -1;
+      int slot = 0;
         double pos       = 0.0;
         double step      = 0.0;
         float  gain      = 0.0f;
@@ -452,70 +540,6 @@ private:
     {
         while (fSampBusy.exchange(true, std::memory_order_acquire))
             std::this_thread::yield();
-    }
-
-    void startVoice(uint8_t note, uint8_t vel) noexcept
-    {
-        SampleVoice* v = nullptr;
-
-        for (SampleVoice& c : fVoices)
-            if (!c.active) { v = &c; break; }
-
-        const bool stolen = (v == nullptr);
-        if (stolen)
-        {
-            v = &fVoices[fNextVoice];
-            fNextVoice = (fNextVoice + 1) % kNumVoices;
-        }
-
-        v->active    = true;
-        v->releasing = false;
-        v->note      = note;
-        v->pos       = std::min(static_cast<double>(fStart.load(std::memory_order_relaxed)) * static_cast<double>(fSampLen - 1), static_cast<double>(fSampLen) - 2.0);
-        v->step      = std::pow(2.0, (note - kRootNote) / 12.0)
-                     * static_cast<double>(fSampRate) / getSampleRate();
-        v->gain      = (vel / 127.0f) * 0.5f;
-        if (!stolen)
-            v->env   = 0.0f; // a stolen voice keeps its envelope to avoid a click
-    }
-
-    void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
-    {
-        if (fSampLen < 2)
-            return;
-
-        const float* const L = fSampL.data();
-        const float* const R = fSampR.data();
-        const double lastPos = static_cast<double>(fSampLen - 1);
-
-        for (SampleVoice& v : fVoices)
-        {
-            if (!v.active)
-                continue;
-
-            const float target = v.releasing ? 0.0f : 1.0f;
-
-            for (uint32_t i = start; i < end; ++i)
-            {
-                v.env += (target - v.env) * 0.01f;
-
-                if (v.pos >= lastPos || (v.releasing && v.env < 0.0005f))
-                {
-                    v.active = false;
-                    break;
-                }
-
-                const uint32_t idx  = static_cast<uint32_t>(v.pos);
-                const float    frac = static_cast<float>(v.pos - idx);
-                const float    amp  = v.env * v.gain;
-
-                // linear interpolation
-                outputs[0][i] += (L[idx] + (L[idx + 1] - L[idx]) * frac) * amp;
-                outputs[1][i] += (R[idx] + (R[idx + 1] - R[idx]) * frac) * amp;
-
-                v.pos += v.step;
-            }
-        }
     }
 
     void renderAudio(float** outputs, uint32_t start, uint32_t end, bool haveLock) noexcept
@@ -536,15 +560,139 @@ private:
         return std::string(home ? home : ".") + "/Samples";
     }
 
+    void startVoice(uint32_t slot, uint8_t note, uint8_t vel) noexcept
+    {
+        Slot& s = fSlots[slot];
+        if (s.len < 2)
+            return;
+
+        SampleVoice* v = nullptr;
+
+        for (SampleVoice& c : fVoices)
+            if (!c.active) { v = &c; break; }
+
+        const bool stolen = (v == nullptr);
+        if (stolen)
+        {
+            v = &fVoices[fNextVoice];
+            fNextVoice = (fNextVoice + 1) % kNumVoices;
+        }
+
+        v->active    = true;
+        v->releasing = false;
+        v->slot      = static_cast<int>(slot);
+        v->note      = note;
+        v->pos       = std::min(static_cast<double>(s.start.load(std::memory_order_relaxed))
+                                    * static_cast<double>(s.len - 1),
+                                static_cast<double>(s.len) - 2.0);
+        v->step      = std::pow(2.0, (note - s.root.load(std::memory_order_relaxed)) / 12.0)
+                     * static_cast<double>(s.rate) / getSampleRate();
+        v->gain      = (vel / 127.0f) * 0.5f;
+        if (!stolen)
+            v->env   = 0.0f;
+    }
+
+    void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
+    {
+        for (SampleVoice& v : fVoices)
+        {
+            if (!v.active)
+                continue;
+
+            const Slot& s = fSlots[v.slot];
+
+            if (s.len < 2)
+            {
+                v.active = false;
+                continue;
+            }
+
+            const float* const L = s.L.data();
+            const float* const R = s.R.data();
+            const double lastPos = static_cast<double>(s.len - 1);
+            const float target   = v.releasing ? 0.0f : 1.0f;
+
+            for (uint32_t i = start; i < end; ++i)
+            {
+                v.env += (target - v.env) * 0.01f;
+
+                if (v.pos >= lastPos || (v.releasing && v.env < 0.0005f))
+                {
+                    v.active = false;
+                    break;
+                }
+
+                const uint32_t idx  = static_cast<uint32_t>(v.pos);
+                const float    frac = static_cast<float>(v.pos - idx);
+                const float    amp  = v.env * v.gain;
+
+                outputs[0][i] += (L[idx] + (L[idx + 1] - L[idx]) * frac) * amp;
+                outputs[1][i] += (R[idx] + (R[idx + 1] - R[idx]) * frac) * amp;
+
+                v.pos += v.step;
+            }
+        }
+    }
+
+    void handleNote(const MidiEvent& ev, bool haveLock) noexcept
+    {
+        if (ev.size < 3)
+            return;
+
+        const uint8_t status = ev.data[0] & 0xF0;
+        const uint8_t note   = ev.data[1];
+        const uint8_t vel    = ev.data[2];
+
+        const bool noteOn  = status == 0x90 && vel > 0;
+        const bool noteOff = status == 0x80 || (status == 0x90 && vel == 0);
+
+        if (noteOn)
+        {
+            if (fAnySample.load(std::memory_order_relaxed))
+            {
+                // Sampler mode: only slots whose key range contains the note play.
+                if (haveLock)
+                {
+                    for (uint32_t s = 0; s < kNumSlots; ++s)
+                    {
+                        if (fSlots[s].len >= 2
+                            && note >= fSlots[s].lo.load(std::memory_order_relaxed)
+                            && note <= fSlots[s].hi.load(std::memory_order_relaxed))
+                            startVoice(s, note, vel);
+                    }
+                }
+            }
+            else
+            {
+                // nothing loaded: sine fallback
+                fNote      = note;
+                fFreq      = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+                fTargetAmp = (vel / 127.0f) * 0.25f;
+            }
+        }
+        else if (noteOff)
+        {
+            for (SampleVoice& v : fVoices)
+                if (v.active && v.note == note)
+                    v.releasing = true;
+
+            if (note == fNote)
+            {
+                fNote      = -1;
+                fTargetAmp = 0.0f;
+            }
+        }
+    }
+
     // Called from setState(), which is not the audio thread.
-    void loadSample(const char* name)
+    void loadSample(uint32_t slot, const char* name)
     {
         const std::string n = name;
 
-        // ignore empty names (default state replay) and anything that tries to leave the folder
-        if (n.empty() || n.find('/') != std::string::npos
-                      || n.find('\\') != std::string::npos
-                      || n.find("..") != std::string::npos)
+        if (slot >= kNumSlots || n.empty()
+            || n.find('/')  != std::string::npos
+            || n.find('\\') != std::string::npos
+            || n.find("..") != std::string::npos)
             return;
 
         const std::string path = samplesFolder() + "/" + n;
@@ -559,19 +707,21 @@ private:
         }
 
         const uint32_t len = static_cast<uint32_t>(L.size());
+        Slot& s = fSlots[slot];
 
         lockSample();
-        fSampL.swap(L);
-        fSampR.swap(R);
-        fSampLen  = len;
-        fSampRate = rate;
-        fHasSample.store(true, std::memory_order_relaxed);
-        fKillVoices.store(true, std::memory_order_release);
+        s.L.swap(L);
+        s.R.swap(R);
+        s.len  = len;
+        s.rate = rate;
+        fKillMask.fetch_or(1u << slot, std::memory_order_release);
         sampleUnlock();
         // the old buffers are freed here, outside the lock
 
-        fSampSeconds.store(static_cast<float>(len) / static_cast<float>(rate));
-        std::printf("Loaded %s (%u frames @ %u Hz)\n", path.c_str(), len, rate);
+        s.seconds.store(static_cast<float>(len) / static_cast<float>(rate));
+        fAnySample.store(true, std::memory_order_relaxed);
+
+        std::printf("Slot %u: loaded %s (%u frames @ %u Hz)\n", slot + 1, path.c_str(), len, rate);
     }  
 
     static void writeLE(std::FILE* f, uint32_t v, int bytes)
@@ -643,46 +793,6 @@ private:
         std::printf("Saved %s (%u frames)\n", path.c_str(), len);
     }  
 
-    void handleNote(const MidiEvent& ev, bool haveLock) noexcept
-    {
-        if (ev.size < 3)
-            return;
-
-        const uint8_t status = ev.data[0] & 0xF0;
-        const uint8_t note   = ev.data[1];
-        const uint8_t vel    = ev.data[2];
-
-        const bool noteOn  = status == 0x90 && vel > 0;
-        const bool noteOff = status == 0x80 || (status == 0x90 && vel == 0);
-
-        if (noteOn)
-        {
-            if (fHasSample.load(std::memory_order_relaxed))
-            {
-                if (haveLock)
-                    startVoice(note, vel);
-            }
-            else
-            {
-                // no sample loaded: sine fallback
-                fNote      = note;
-                fFreq      = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
-                fTargetAmp = (vel / 127.0f) * 0.25f;
-            }
-        }
-        else if (noteOff)
-        {
-            for (SampleVoice& v : fVoices)
-                if (v.active && v.note == note)
-                    v.releasing = true;
-
-            if (note == fNote)
-            {
-                fNote      = -1;
-                fTargetAmp = 0.0f;
-            }
-        }
-    }  
 
     void renderSine(float** outputs, uint32_t start, uint32_t end) noexcept
     {

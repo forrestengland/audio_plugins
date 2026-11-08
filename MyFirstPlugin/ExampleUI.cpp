@@ -23,11 +23,23 @@ static const uint32_t kPeakBins = 1024;
 static const float kListTop = 372.0f; // y of the first row
 static const float kRowH    = 18.0f;
 
+static const float kColW     = 400.0f;  // left column width; the right column starts here
+static const float kSlotX    = 420.0f;
+static const float kSlotW    = 360.0f;
+static const float kSlotTop  = 52.0f;
+static const float kSlotRowH = 22.0f;
+static const float kEditTop  = 440.0f;
+static const float kMinusX   = 520.0f;
+static const float kPlusX    = 700.0f;
+
+static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
+static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
+
 class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(400, 694),
+    : UI(800, 694),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -55,7 +67,7 @@ protected:
             if (fDraggingStart)
             {
                 fDraggingStart = false;
-                editParameter(5, false);
+                editParameter(slotParam(fSel, 4), false);
                 return true;
             }
             return false;
@@ -66,7 +78,7 @@ protected:
 
         // Text field: click inside to edit, click anywhere else to stop editing.
         const double fy = getHeight() - 148.0;
-        const bool inField = x >= 70 && x <= getWidth() - 20
+        const bool inField = x >= 70 && x <= kColW - 20
                           && y >= fy && y <= fy + 24.0;
 
         if (inField)
@@ -82,18 +94,41 @@ protected:
             repaint();
         }
 
+        // Right column: slot list and key-range editor.
+        if (x >= kSlotX && x <= kSlotX + kSlotW)
+        {
+            if (y >= kSlotTop && y < kSlotTop + 16 * kSlotRowH)
+            {
+                selectSlot(static_cast<int>((y - kSlotTop) / kSlotRowH));
+                return true;
+            }
+
+            const int step = (ev.mod & kModifierShift) ? 12 : 1;
+
+            for (int k = 0; k < 3; ++k)
+            {
+                const double ry = editRowY(k);
+                if (y < ry || y > ry + 24.0)
+                    continue;
+
+                if (x >= kMinusX && x <= kMinusX + 26.0) { adjustSlot(k + 1, -step); return true; }
+                if (x >= kPlusX  && x <= kPlusX  + 26.0) { adjustSlot(k + 1,  step); return true; }
+            }
+            return true;
+        }	
+
 	// Waveform: click or drag to set the start point.
-        if (!fPeakMin.empty() && x >= 20 && x <= getWidth() - 20
+        if (!fPeakMin.empty() && x >= 20 && x <= kColW - 20
                               && y >= kWaveTop && y <= kWaveTop + kWaveH)
         {
             fDraggingStart = true;
-            editParameter(5, true); // tells the host a gesture started
+            editParameter(slotParam(fSel, 4), true); // tells the host a gesture started
             setStartFromX(x);
             return true;
         }
 
         // File list: click to select a row.
-        if (x >= 20 && x <= getWidth() - 20 && y >= kListTop && y < listBottom())
+        if (x >= 20 && x <= kColW - 20 && y >= kListTop && y < listBottom())
         {
             const int row = static_cast<int>((y - kListTop) / kRowH);
             const int idx = fFirstRow + row;
@@ -128,14 +163,15 @@ protected:
             return true;
         }
 
-        if (x >= 240 && x <= 340)
+	if (x >= 240 && x <= 340)
         {
-	  if (!fSelected.empty()) {
-	    fPendingLoad = fSelected;
-	    setState("load", fSelected.c_str());
-	  }
-	  return true;
-        }	
+            if (!fSelected.empty() && loadPeaks(fSelected))
+            {
+                fSlot[fSel].name = fSelected;
+                setState(("slot" + std::to_string(fSel + 1)).c_str(), fSelected.c_str());
+            }
+            return true;
+        }
 
         return false;
     }
@@ -153,6 +189,26 @@ protected:
     {
         const double x = ev.pos.getX();
         const double y = ev.pos.getY();
+
+        if (x >= kSlotX && x <= kSlotX + kSlotW)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (y >= editRowY(k) && y <= editRowY(k) + 24.0)
+                {
+                    fWheelAcc += ev.delta.getY();
+                    const int steps = static_cast<int>(fWheelAcc);
+
+                    if (steps != 0)
+                    {
+                        fWheelAcc -= static_cast<float>(steps);
+                        adjustSlot(k + 1, steps);
+                    }
+                    return true;
+                }
+            }
+            return true;
+        }	
 
         if (x < 20 || x > getWidth() - 20 || y < kListTop || y > listBottom())
             return false;
@@ -253,14 +309,118 @@ protected:
             repaint();
     }
 
+    void drawSlots()
+    {
+        fontSize(14.0f);
+        fillColor(Color(100, 220, 140));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kSlotX, 30.0f, "SAMPLE SLOTS", nullptr);
+
+        beginPath();
+        roundedRect(kSlotX, kSlotTop, kSlotW, kSlotRowH * 16, 4.0f);
+        fillColor(Color(40, 40, 46));
+        fill();
+
+        fontSize(12.0f);
+
+        for (int i = 0; i < 16; ++i)
+        {
+            const SlotInfo& s = fSlot[i];
+            const float ry  = kSlotTop + i * kSlotRowH;
+            const float mid = ry + kSlotRowH * 0.5f;
+
+            if (i == fSel)
+            {
+                beginPath();
+                rect(kSlotX + 2.0f, ry + 1.0f, kSlotW - 4.0f, kSlotRowH - 2.0f);
+                fillColor(Color(55, 105, 75));
+                fill();
+            }
+
+            char num[8];
+            std::snprintf(num, sizeof(num), "%02d", i + 1);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            fillColor(Color(140, 140, 150));
+            text(kSlotX + 8.0f, mid, num, nullptr);
+
+            if (s.name.empty())
+            {
+                fillColor(Color(100, 100, 110));
+                text(kSlotX + 34.0f, mid, "(empty)", nullptr);
+                continue;
+            }
+
+            std::string shown = s.name;
+            if (shown.size() > 28)
+                shown = shown.substr(0, 26) + "..";
+
+            fillColor(Color(220, 220, 225));
+            text(kSlotX + 34.0f, mid, shown.c_str(), nullptr);
+
+            char lo[8], hi[8], range[24];
+            noteLabel(s.lo, lo, sizeof(lo));
+            noteLabel(s.hi, hi, sizeof(hi));
+            std::snprintf(range, sizeof(range), "%s-%s", lo, hi);
+
+            fillColor(Color(140, 140, 150));
+            textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
+            text(kSlotX + kSlotW - 8.0f, mid, range, nullptr);
+        }
+
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+    }
+
+    void drawEditor()
+    {
+        static const char* const labels[] = { "ROOT NOTE", "KEY LOW", "KEY HIGH" };
+
+        const SlotInfo& s = fSlot[fSel];
+        const int vals[3] = { s.root, s.lo, s.hi };
+
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "SLOT %d SETTINGS", fSel + 1);
+
+        fontSize(14.0f);
+        fillColor(Color(100, 220, 140));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kSlotX, kEditTop, buf, nullptr);
+
+        for (int k = 0; k < 3; ++k)
+        {
+            const float y = editRowY(k);
+
+            fontSize(12.0f);
+            fillColor(Color(220, 220, 225));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kSlotX, y + 12.0f, labels[k], nullptr);
+
+            drawButton("-", kMinusX, y, 26.0f, 24.0f, Color(70, 70, 80));
+            drawButton("+", kPlusX,  y, 26.0f, 24.0f, Color(70, 70, 80));
+
+            char nb[8];
+            noteLabel(vals[k], nb, sizeof(nb));
+            std::snprintf(buf, sizeof(buf), "%s  (%d)", nb, vals[k]);
+
+            fontSize(13.0f);
+            fillColor(Color(255, 255, 255));
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            text((kMinusX + 26.0f + kPlusX) * 0.5f, y + 12.0f, buf, nullptr);
+        }
+
+        fontSize(11.0f);
+        fillColor(Color(140, 140, 150));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kSlotX, editRowY(2) + 44.0f, "Click +/-: 1 note   Shift-click: octave   Wheel: 1 note", nullptr);
+    }  
+
     void onNanoDisplay() override
     {
-        const float width = getWidth();
+        const float width = kColW;
         const float height = getHeight();
 
         // Background.
         beginPath();
-        rect(0, 0, width, height);
+        rect(0, 0, getWidth(), height);
         fillColor(30, 30, 35, 255);
         fill();
 
@@ -337,6 +497,9 @@ protected:
             }
         }
 
+	drawSlots();
+	drawEditor();
+
 	drawWaveform(width);
 	drawFileList(width);
 
@@ -347,8 +510,10 @@ protected:
                    fRecording ? Color(200, 60, 60) : Color(70, 70, 80));
         drawButton("SAVE", 130, by, 100, 24, Color(70, 70, 80));
 
-        drawButton("LOAD", 240, by, 100, 24,
-                   fSelected.empty() ? Color(55, 55, 62) : Color(70, 70, 80));	
+	char loadLabel[16];
+        std::snprintf(loadLabel, sizeof(loadLabel), "LOAD > %d", fSel + 1);
+        drawButton(loadLabel, 240, by, 100, 24,
+                   fSelected.empty() ? Color(55, 55, 62) : Color(70, 70, 80));
 
 	// Level meters, anchored to the bottom of the window.
         fontSize(12.0f);
@@ -359,26 +524,39 @@ protected:
         drawMeter("R", 20, height - 34, width - 40, 16, fLevelR);
     }
 
-      void parameterChanged(uint32_t index, float value) override
+    void parameterChanged(uint32_t index, float value) override
     {
-        switch (index)
+        if (index >= 4)
         {
-        case 0: fColor = value; break;
-        case 1: fLevelL = value; break;
-        case 2: fLevelR = value; break;
-	case 3: fRecording = value > 0.5f; break;
-	case 4:
-	  fSampSec = value;
-	  if (value > 0.0f && !fPendingLoad.empty()) {
-	    loadPeaks(fPendingLoad);
-	    fPendingLoad.clear();
-	  }
-	  break;
-	case 5: fStartFrac = value; break;
+            const uint32_t s = (index - 4) / 5;
+
+            if (s < 16)
+            {
+                SlotInfo& si = fSlot[s];
+
+                switch ((index - 4) % 5)
+                {
+                case 0: si.sec   = value; break;
+                case 1: si.root  = static_cast<int>(value + 0.5f); break;
+                case 2: si.lo    = static_cast<int>(value + 0.5f); break;
+                case 3: si.hi    = static_cast<int>(value + 0.5f); break;
+                case 4: si.start = value; break;
+                }
+            }
+        }
+        else
+        {
+            switch (index)
+            {
+            case 0: fColor = value; break;
+            case 1: fLevelL = value; break;
+            case 2: fLevelR = value; break;
+            case 3: fRecording = value > 0.5f; break;
+            }
         }
 
         repaint();
-    }
+    }  
 
       void stateChanged(const char* key, const char* value) override
     {
@@ -391,9 +569,18 @@ protected:
         {
             fFolder = value;
             scanSamples();
-        } else if (std::strcmp(key, "load") == 0) {
-	  loadPeaks(value);
 	}
+        else if (std::strncmp(key, "slot", 4) == 0)
+        {
+            const int n = std::atoi(key + 4);
+
+            if (n >= 1 && n <= 16)
+            {
+                fSlot[n - 1].name = value;
+                if (n - 1 == fSel)
+                    loadPeaks(value);
+            }
+        }	    
     }
 
 private:
@@ -418,50 +605,89 @@ private:
     float fScrollAcc = 0.0f;
     int   fScanTick  = 0;
 
-    float fSampSec = 0.0f;
-
     std::vector<float> fPeakMin, fPeakMax;
-    std::string fLoadedName, fPendingLoad;
-    float fStartFrac     = 0.0f;
     bool  fDraggingStart = false;
 
-    void setStartFromX(double x)
+      struct SlotInfo
     {
-        const float f = (static_cast<float>(x) - 20.0f) / (getWidth() - 40.0f);
-        fStartFrac = std::min(1.0f, std::max(0.0f, f));
-        setParameterValue(5, fStartFrac);
+        std::string name;
+        int   root = 60, lo = 0, hi = 127;
+        float sec = 0.0f, start = 0.0f;
+    };
+
+    SlotInfo fSlot[16];
+    int      fSel      = 0;
+    float    fWheelAcc = 0.0f;
+
+    static void noteLabel(int n, char* buf, size_t size)
+    {
+        static const char* const names[] = { "C", "C#", "D", "D#", "E", "F",
+                                             "F#", "G", "G#", "A", "A#", "B" };
+        std::snprintf(buf, size, "%s%d", names[n % 12], n / 12 - 1);
+    }
+
+    void selectSlot(int i)
+    {
+        fSel = i;
+        fPeakMin.clear();
+        fPeakMax.clear();
+
+        if (!fSlot[i].name.empty())
+            loadPeaks(fSlot[i].name);
+
+        repaint();
+    }
+
+    // field: 1 = root, 2 = key low, 3 = key high
+    void adjustSlot(int field, int delta)
+    {
+        SlotInfo& s = fSlot[fSel];
+        int& v = (field == 1) ? s.root : (field == 2) ? s.lo : s.hi;
+
+        v = std::min(127, std::max(0, v + delta));
+        setParameterValue(slotParam(fSel, field), static_cast<float>(v));
+
+        // keep low <= high by pushing the other end along
+        if (field == 2 && s.lo > s.hi)
+        {
+            s.hi = s.lo;
+            setParameterValue(slotParam(fSel, 3), static_cast<float>(s.hi));
+        }
+        else if (field == 3 && s.hi < s.lo)
+        {
+            s.lo = s.hi;
+            setParameterValue(slotParam(fSel, 2), static_cast<float>(s.lo));
+        }
+
+        repaint();
+    }
+
+  void setStartFromX(double x)
+    {
+        const float f = (static_cast<float>(x) - 20.0f) / (kColW - 40.0f);
+        fSlot[fSel].start = std::min(1.0f, std::max(0.0f, f));
+        setParameterValue(slotParam(fSel, 4), fSlot[fSel].start);
         repaint();
     }
 
     // Reads the loaded file and reduces it to min/max pairs for drawing.
-    void loadPeaks(const std::string& name)
+    bool loadPeaks(const std::string& name)
     {
-        fPeakMin.clear();
-        fPeakMax.clear();
-        fLoadedName.clear();
-
-        if (name.empty() || name.find('/') != std::string::npos
+        if (name.empty() || name.find('/')  != std::string::npos
                          || name.find('\\') != std::string::npos
                          || name.find("..") != std::string::npos)
-        {
-            repaint();
-            return;
-        }
+            return false;
 
         std::vector<float> L, R;
         uint32_t rate = 0;
 
         if (!readWav(samplesFolder() + "/" + name, L, R, rate))
-        {
-            repaint();
-            return;
-        }
+            return false;
 
         const size_t len  = L.size();
         const size_t bins = std::min<size_t>(kPeakBins, len);
 
-        fPeakMin.assign(bins, 0.0f);
-        fPeakMax.assign(bins, 0.0f);
+        std::vector<float> pmin(bins, 0.0f), pmax(bins, 0.0f);
 
         for (size_t b = 0; b < bins; ++b)
         {
@@ -475,13 +701,15 @@ private:
                 lo = std::min({lo, L[i], R[i]});
                 hi = std::max({hi, L[i], R[i]});
             }
-            fPeakMin[b] = lo;
-            fPeakMax[b] = hi;
+            pmin[b] = lo;
+            pmax[b] = hi;
         }
 
-        fLoadedName = name;
+        fPeakMin.swap(pmin);
+        fPeakMax.swap(pmax);
         repaint();
-    }
+        return true;
+    }  
 
     void drawWaveform(float width)
     {
@@ -499,7 +727,7 @@ private:
         if (!fPeakMin.empty())
         {
             char buf[40];
-            std::snprintf(buf, sizeof(buf), "START %.3f s", fStartFrac * fSampSec);
+            std::snprintf(buf, sizeof(buf), "START %.3f s", fSlot[fSel].start * fSlot[fSel].sec);
 
             fontSize(12.0f);
             fillColor(Color(140, 140, 150));
@@ -567,7 +795,7 @@ private:
         stroke();
 
         // Dim the part before the start point, since it will be skipped.
-        const float sx = x + w * fStartFrac;
+        const float sx = x + w * fSlot[fSel].start;
 
         beginPath();
         rect(x, y, sx - x, h);
@@ -677,11 +905,13 @@ private:
         text(x + w, kListTop - 18.0f, buf, nullptr);
 
         char mem[40];
-        if (fSampSec > 0.0f)
-            std::snprintf(mem, sizeof(mem), "MEM %.2f s", fSampSec);
+        if (fSlot[fSel].sec > 0.0f)
+            std::snprintf(mem, sizeof(mem), "SLOT %d  %.2f s", fSel + 1, fSlot[fSel].sec);
         else
-            std::snprintf(mem, sizeof(mem), "MEM empty");
+            std::snprintf(mem, sizeof(mem), "SLOT %d  empty", fSel + 1);
 
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x + 90.0f, kListTop - 18.0f, mem, nullptr);
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
         text(x + 90.0f, kListTop - 18.0f, mem, nullptr);	
 
