@@ -53,6 +53,8 @@ static const float kSliderW = 150.0f;
 
 static const uint32_t kEnvParam = 229;
 
+static const uint32_t kFEnvParam = 293;
+
 // times: 1 ms .. 10 s, log scale
 static float timeToFrac(float t)
 {
@@ -215,7 +217,7 @@ protected:
             if (y >= iy && y <= iy + 24.0 && x >= kCol3X + 130.0)
                 toggleInterp();
 
-            for (int k = 0; k < 6; ++k)
+            for (int k = 0; k < 11; ++k)
             {
                 const double ry = col3RowY(sliderRow(k));
                 if (y >= ry && y <= ry + 24.0 && x >= kSliderX - 8.0 && x <= kSliderX + kSliderW + 8.0)
@@ -677,6 +679,34 @@ protected:
 
             fmtTime(s.rel, vb, sizeof(vb));
             drawSlider("RELEASE", col3RowY(8), timeToFrac(s.rel), vb);
+        }
+
+        // Rows 9-14: filter envelope.
+        {
+            fontSize(14.0f);
+            fillColor(Color(100, 220, 140));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kCol3X, col3RowY(9) + 12.0f, "FILTER ENVELOPE", nullptr);
+
+            char vb[24];
+
+            if (s.famt == 0.0f)
+                std::snprintf(vb, sizeof(vb), "OFF");
+            else
+                std::snprintf(vb, sizeof(vb), "%+.1f oct", s.famt * 7.0f);
+            drawSlider("AMOUNT", col3RowY(10), (s.famt + 1.0f) * 0.5f, vb);
+
+            fmtTime(s.fatt, vb, sizeof(vb));
+            drawSlider("ATTACK",  col3RowY(11), timeToFrac(s.fatt), vb);
+
+            fmtTime(s.fdec, vb, sizeof(vb));
+            drawSlider("DECAY",   col3RowY(12), timeToFrac(s.fdec), vb);
+
+            std::snprintf(vb, sizeof(vb), "%.0f%%", s.fsus * 100.0f);
+            drawSlider("SUSTAIN", col3RowY(13), s.fsus, vb);
+
+            fmtTime(s.frel, vb, sizeof(vb));
+            drawSlider("RELEASE", col3RowY(14), timeToFrac(s.frel), vb);
         }	
 
         fontSize(11.0f);
@@ -806,6 +836,23 @@ protected:
             repaint();
             return;
         }
+
+        if (index >= kFEnvParam)
+        {
+            const uint32_t g = (index - kFEnvParam) / 16;
+            const uint32_t s = (index - kFEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlot[s].fatt = value; break;
+            case 1: fSlot[s].fdec = value; break;
+            case 2: fSlot[s].fsus = value; break;
+            case 3: fSlot[s].frel = value; break;
+            case 4: fSlot[s].famt = value; break;
+            }
+            repaint();
+            return;
+        }      
 
         if (index >= kEnvParam)
         {
@@ -968,6 +1015,7 @@ private:
     bool interp = true;
     float cutoff = 20000.0f, res = 0.0f;
     float att = 0.002f, dec = 0.1f, sus = 1.0f, rel = 0.005f;
+    float fatt = 0.001f, fdec = 0.3f, fsus = 0.0f, frel = 0.3f, famt = 0.0f;    
   };
 
     SlotInfo fSlot[16];
@@ -983,11 +1031,14 @@ private:
 
     uint32_t sliderParam(int which) const
     {
-        return which < 2 ? kFilterParam + which * 16 + fSel
-                         : kEnvParam + (which - 2) * 16 + fSel;
+        if (which < 2) return kFilterParam + which * 16 + fSel;
+        if (which < 6) return kEnvParam + (which - 2) * 16 + fSel;
+
+        const int g = (which == 6) ? 4 : (which - 7); // amount is the 5th group
+        return kFEnvParam + g * 16 + fSel;
     }
 
-    static int sliderRow(int which) { return which < 2 ? which + 1 : which + 3; }
+    static int sliderRow(int which) { return which < 2 ? which + 1 : which < 6 ? which + 3 : which + 4; }
 
     void setSliderFromX(double x)
     {
@@ -998,12 +1049,23 @@ private:
 
         switch (fDragSlider)
         {
-        case 0: v = s.cutoff = (f >= 0.99f) ? 20000.0f : fracToCutoff(f); break;
-        case 1: v = s.res    = f;                                         break;
-        case 2: v = s.att    = fracToTime(f);                             break;
-        case 3: v = s.dec    = fracToTime(f);                             break;
-        case 4: v = s.sus    = f;                                         break;
-        case 5: v = s.rel    = fracToTime(f);                             break;
+        case 0:  v = s.cutoff = (f >= 0.99f) ? 20000.0f : fracToCutoff(f); break;
+        case 1:  v = s.res    = f;                                         break;
+        case 2:  v = s.att    = fracToTime(f);                             break;
+        case 3:  v = s.dec    = fracToTime(f);                             break;
+        case 4:  v = s.sus    = f;                                         break;
+        case 5:  v = s.rel    = fracToTime(f);                             break;
+        case 6:
+        {
+            float a = f * 2.0f - 1.0f;
+            if (std::fabs(a) < 0.03f) a = 0.0f; // snap to zero in the middle
+            v = s.famt = a;
+            break;
+        }
+        case 7:  v = s.fatt   = fracToTime(f);                             break;
+        case 8:  v = s.fdec   = fracToTime(f);                             break;
+        case 9:  v = s.fsus   = f;                                         break;
+        case 10: v = s.frel   = fracToTime(f);                             break;
         default: return;
         }
 

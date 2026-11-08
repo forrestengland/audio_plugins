@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(293, 0, 19),
+        : MidiMonitorPlugin(373, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,46 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kFEnvParam)
+        {
+            static const char* const names[] = { "fenv-attack", "fenv-decay", "fenv-sustain",
+                                                 "fenv-release", "fenv-amount" };
+            static const char* const syms[]  = { "fenv_attack", "fenv_decay", "fenv_sustain",
+                                                 "fenv_release", "fenv_amount" };
+
+            const uint32_t g = (index - kFEnvParam) / 16;
+            const uint32_t s = (index - kFEnvParam) % 16;
+            if (g > 4) return;
+
+            char name[48], sym[48];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, names[g]);
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, syms[g]);
+            parameter.name   = name;
+            parameter.symbol = sym;
+
+            if (g == 2)
+            {
+                parameter.hints      = kParameterIsAutomatable;
+                parameter.ranges.def = 0.0f;
+            }
+            else if (g == 4)
+            {
+                parameter.hints      = kParameterIsAutomatable;
+                parameter.ranges.min = -1.0f;
+                parameter.ranges.max = 1.0f;
+                parameter.ranges.def = 0.0f;
+            }
+            else
+            {
+                parameter.hints      = kParameterIsAutomatable|kParameterIsLogarithmic;
+                parameter.unit       = "s";
+                parameter.ranges.min = 0.001f;
+                parameter.ranges.max = 10.0f;
+                parameter.ranges.def = (g == 0) ? 0.001f : 0.3f;
+            }
+            return;
+        }	
 
         if (index >= kEnvParam)
         {
@@ -395,6 +435,22 @@ protected:
             case 3: return fSlots[s].release.load();
             }
             return 0.0f;
+        }
+
+        if (index >= kFEnvParam)
+        {
+            const uint32_t g = (index - kFEnvParam) / 16;
+            const uint32_t s = (index - kFEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: return fSlots[s].fenvAtt.load();
+            case 1: return fSlots[s].fenvDec.load();
+            case 2: return fSlots[s].fenvSus.load();
+            case 3: return fSlots[s].fenvRel.load();
+            case 4: return fSlots[s].fenvAmt.load();
+            }
+            return 0.0f;
         }	
 
         if (index >= kFilterParam)
@@ -469,6 +525,22 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kFEnvParam)
+        {
+            const uint32_t g = (index - kFEnvParam) / 16;
+            const uint32_t s = (index - kFEnvParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlots[s].fenvAtt.store(value); break;
+            case 1: fSlots[s].fenvDec.store(value); break;
+            case 2: fSlots[s].fenvSus.store(value); break;
+            case 3: fSlots[s].fenvRel.store(value); break;
+            case 4: fSlots[s].fenvAmt.store(value); break;
+            }
+            return;
+        }      
 
         if (index >= kEnvParam)
         {
@@ -775,7 +847,13 @@ private:
         std::atomic<float> attack  { 0.002f };
         std::atomic<float> decay   { 0.1f };
         std::atomic<float> sustain { 1.0f };
-        std::atomic<float> release { 0.005f };      
+        std::atomic<float> release { 0.005f };
+
+        std::atomic<float> fenvAtt { 0.001f };
+        std::atomic<float> fenvDec { 0.3f };
+        std::atomic<float> fenvSus { 0.0f };
+        std::atomic<float> fenvRel { 0.3f };
+        std::atomic<float> fenvAmt { 0.0f };   // -1..+1, times 7 octaves      
     };
 
     Slot fSlots[kNumSlots];
@@ -795,6 +873,8 @@ private:
         float  env       = 0.0f;
         float  ic1L = 0.0f, ic2L = 0.0f, ic1R = 0.0f, ic2R = 0.0f; // filter state
       int stage = 0; // 0 attack, 1 decay, 2 sustain - 'releasing' above sets release stage
+        float  fenv   = 0.0f;
+        int    fstage = 0;     // 0 attack, 1 decay, 2 sustain      
     };
 
     SampleVoice fVoices[kNumVoices];
@@ -807,7 +887,8 @@ private:
     static constexpr uint32_t kInterpParam = 181; // 181..196 = slot interpolation  
                                                // 149..164 loop end, 165..180 loop on
     static constexpr uint32_t kFilterParam = 197; // 197..212 cutoff, 213..228 resonance
-    static constexpr uint32_t kEnvParam = 229; // 229 attack, 245 decay, 261 sustain, 277 release  
+    static constexpr uint32_t kEnvParam = 229; // 229 attack, 245 decay, 261 sustain, 277 release
+    static constexpr uint32_t kFEnvParam = 293; // attack, decay, sustain, release, amount (16 each)  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -871,6 +952,8 @@ private:
             v->env   = 0.0f;
         v->ic1L = v->ic2L = v->ic1R = v->ic2R = 0.0f;
 	v->stage = 0;
+        v->fenv   = 0.0f;
+        v->fstage = 0;	
     }
     void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
     {
@@ -916,22 +999,36 @@ private:
 
             const bool interp = s.interp.load(std::memory_order_relaxed);
 
-            // resonant low-pass (TPT state-variable filter); fully open = bypass
+            // resonant low-pass (TPT state-variable filter). Bypassed only when fully
+            // open and the filter envelope is off.
             const float cutoff = s.cutoff.load(std::memory_order_relaxed);
-            const bool  filt   = cutoff < 19999.0f;
+            const float fAmt   = s.fenvAmt.load(std::memory_order_relaxed);
+            const bool  fMod   = std::fabs(fAmt) > 0.001f;
+            const bool  filt   = fMod || cutoff < 19999.0f;
+
+            const float fSr    = static_cast<float>(getSampleRate());
+            const float fK     = 1.4f - 1.35f * s.res.load(std::memory_order_relaxed); // damping, Q ~0.7..20
+            const float fMaxHz = 0.45f * fSr;
             float fa1 = 0.0f, fa2 = 0.0f, fa3 = 0.0f;
 
-            if (filt)
+            auto setCoef = [&](float hz) noexcept
             {
-                const float sr = static_cast<float>(getSampleRate());
-                const float fc = std::min(cutoff, 0.45f * sr);
-                const float g  = std::tan(3.14159265f * fc / sr);
-                const float k  = 1.4f - 1.35f * s.res.load(std::memory_order_relaxed); // damping, Q ~0.7..20
-
-                fa1 = 1.0f / (1.0f + g * (g + k));
+                const float fc = std::min(fMaxHz, std::max(20.0f, hz));
+                const float g  = std::tan(3.14159265f * fc / fSr);
+                fa1 = 1.0f / (1.0f + g * (g + fK));
                 fa2 = g * fa1;
                 fa3 = g * fa2;
-            }
+            };
+
+            if (filt && !fMod)
+                setCoef(cutoff);
+
+            // filter envelope rates (same shapes as the amp envelope)
+            const float fSusLvl = std::min(1.0f, std::max(0.0f, s.fenvSus.load(std::memory_order_relaxed)));
+            const float fAttInc = 1.0f / (std::max(0.001f, s.fenvAtt.load(std::memory_order_relaxed)) * fSr);
+            const float fDecDec = (1.0f - fSusLvl) / (std::max(0.001f, s.fenvDec.load(std::memory_order_relaxed)) * fSr);
+            const float fRelCoef = std::exp(-6.9f / (std::max(0.001f, s.fenvRel.load(std::memory_order_relaxed)) * fSr));
+            int fCount = 0;	    
 	    
             for (uint32_t i = start; i < end; ++i)
             {
@@ -969,6 +1066,31 @@ private:
                 const uint32_t idx  = static_cast<uint32_t>(v.pos);
                 const float    frac = static_cast<float>(v.pos - idx);
                 const float    amp  = v.env * v.gain * slotGain;
+
+                if (fMod)
+                {
+                    if (v.releasing)
+                    {
+                        v.fenv *= fRelCoef;
+                    }
+                    else if (v.fstage == 0)
+                    {
+                        v.fenv += fAttInc;
+                        if (v.fenv >= 1.0f) { v.fenv = 1.0f; v.fstage = 1; }
+                    }
+                    else if (v.fstage == 1)
+                    {
+                        v.fenv -= fDecDec;
+                        if (v.fenv <= fSusLvl) { v.fenv = fSusLvl; v.fstage = 2; }
+                    }
+                    else
+                    {
+                        v.fenv = fSusLvl;
+                    }
+
+                    if ((fCount++ & 7) == 0)
+                        setCoef(cutoff * std::exp2(fAmt * 7.0f * v.fenv));
+                }		
 
                 float l, r;
 
