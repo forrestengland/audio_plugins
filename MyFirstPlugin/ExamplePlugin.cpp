@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(101, 0, 19),
+        : MidiMonitorPlugin(117, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,17 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kBitParam)
+        {
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-bit8", index - kBitParam + 1);
+            std::snprintf(sym,  sizeof(sym),  "s%u_bit8",    index - kBitParam + 1);
+            parameter.name   = name;
+            parameter.symbol = sym;
+            parameter.hints  = kParameterIsAutomatable|kParameterIsBoolean;
+            return; // range stays 0..1, default 0 (16-bit)
+        }	
 
         if (index >= kGainParam)
         {
@@ -281,6 +292,12 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+        if (index >= kBitParam)
+        {
+            const uint32_t s = index - kBitParam;
+            return (s < kNumSlots && fSlots[s].bit8.load()) ? 1.0f : 0.0f;
+        }	
+
         if (index >= kGainParam)
         {
             const uint32_t s = index - kGainParam;
@@ -319,6 +336,14 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kBitParam)
+        {
+            const uint32_t s = index - kBitParam;
+            if (s < kNumSlots)
+                fSlots[s].bit8.store(value > 0.5f);
+            return;
+        }	
 
         if (index >= kGainParam)
         {
@@ -557,7 +582,8 @@ private:
         std::atomic<float> start   { 0.0f };
         std::atomic<float> seconds { 0.0f };
         std::atomic<float> gainDb  { 0.0f };
-        std::atomic<float> gainLin { 1.0f };      
+        std::atomic<float> gainLin { 1.0f };
+      std::atomic<bool> bit8 {false};
     };
 
     Slot fSlots[kNumSlots];
@@ -581,7 +607,8 @@ private:
     uint32_t    fNextVoice = 0;
 
     static constexpr uint32_t kLearnParam = 84;
-    static constexpr uint32_t kGainParam = 85; // 85..100 = slot gains  
+    static constexpr uint32_t kGainParam = 85; // 85..100 = slot gains
+  static constexpr uint32_t kBitParam = 101; // 101..116 = slot 8-bit toggles
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -666,6 +693,14 @@ private:
             const float target   = v.releasing ? 0.0f : 1.0f;
             const float slotGain = s.gainLin.load(std::memory_order_relaxed);
 
+            // quantize to 8 or 16 bits: round to the nearest step and clamp to the signed range
+            const float qs = s.bit8.load(std::memory_order_relaxed) ? 128.0f : 32768.0f;
+            auto quant = [qs](float x) noexcept
+            {
+	      const float q = std::floor(x * qs + 0.5f);
+	      return std::min(qs - 1.0f, std::max(-qs, q)) / qs;
+            };	    
+
             for (uint32_t i = start; i < end; ++i)
             {
                 v.env += (target - v.env) * 0.01f;
@@ -680,8 +715,11 @@ private:
                 const float    frac = static_cast<float>(v.pos - idx);
                 const float    amp  = v.env * v.gain * slotGain;
 
-                outputs[0][i] += (L[idx] + (L[idx + 1] - L[idx]) * frac) * amp;
-                outputs[1][i] += (R[idx] + (R[idx + 1] - R[idx]) * frac) * amp;
+                const float l0 = quant(L[idx]), l1 = quant(L[idx + 1]);
+                const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
+
+                outputs[0][i] += (l0 + (l1 - l0) * frac) * amp;
+                outputs[1][i] += (r0 + (r1 - r0) * frac) * amp;		
 
                 v.pos += v.step;
             }

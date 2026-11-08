@@ -39,6 +39,8 @@ static const uint32_t kLearnParam = 84;
 
 static const uint32_t kGainParam = 85;
 
+static const uint32_t kBitParam = 101;
+
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
 static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
 
@@ -140,6 +142,14 @@ protected:
                 else if (x > kMinusX + 26.0 && x < kPlusX)
                     adjustGain(-fSlot[fSel].gain); // reset to 0 dB
 
+                return true;
+            }
+
+            const double by8 = editRowY(4);
+            if (y >= by8 && y <= by8 + 24.0)
+            {
+                if (x >= kMinusX && x <= kPlusX + 26.0)
+                    toggleBit();
                 return true;
             }	    
 	    
@@ -471,10 +481,22 @@ protected:
             text((kMinusX + 26.0f + kPlusX) * 0.5f, gy + 12.0f, buf, nullptr);
         }
 
+        {
+            const float by8 = editRowY(4);
+
+            fontSize(12.0f);
+            fillColor(Color(220, 220, 225));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kSlotX, by8 + 12.0f, "BIT DEPTH", nullptr);
+
+            drawButton(s.bit8 ? "8-BIT" : "16-BIT", kMinusX, by8, kPlusX + 26.0f - kMinusX, 24.0f,
+                       s.bit8 ? Color(200, 150, 40) : Color(70, 70, 80));
+        }	
+
         fontSize(11.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(kSlotX, editRowY(3) + 44.0f,
+        text(kSlotX, editRowY(4) + 44.0f,
              "Click +/-: 1 step (Shift: octave / 6 dB)   Wheel: 1 step   Click gain value: reset", nullptr);	
 
     }  
@@ -600,6 +622,14 @@ protected:
             return;
         }
 
+        if (index >= kBitParam)
+        {
+            if (index - kBitParam < 16)
+                fSlot[index - kBitParam].bit8 = value > 0.5f;
+            repaint();
+            return;
+        }      
+
         if (index >= kGainParam)
         {
             if (index - kGainParam < 16)
@@ -696,6 +726,7 @@ private:
         int   root = 60, lo = 0, hi = 127;
         float sec = 0.0f, start = 0.0f;
       float gain = 0.0f;
+      bool bit8 = false;
     };
 
     SlotInfo fSlot[16];
@@ -742,6 +773,14 @@ private:
 
         repaint();
     }
+
+    void toggleBit()
+    {
+        bool& b = fSlot[fSel].bit8;
+        b = !b;
+        setParameterValue(kBitParam + fSel, b ? 1.0f : 0.0f);
+        repaint();
+    }  
 
     void adjustGain(float delta)
     {
