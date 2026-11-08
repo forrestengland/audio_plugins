@@ -55,6 +55,16 @@ static const uint32_t kEnvParam = 229;
 
 static const uint32_t kFEnvParam = 293;
 
+static const uint32_t kPitchParam = 373;
+
+// LFO speed: 0.1 .. 20 Hz, log scale
+static float lfoToFrac(float hz)
+{
+    hz = std::min(20.0f, std::max(0.1f, hz));
+    return std::log(hz / 0.1f) / std::log(200.0f);
+}
+static float fracToLfo(float f) { return 0.1f * std::pow(200.0f, f); }
+
 // times: 1 ms .. 10 s, log scale
 static float timeToFrac(float t)
 {
@@ -217,7 +227,7 @@ protected:
             if (y >= iy && y <= iy + 24.0 && x >= kCol3X + 130.0)
                 toggleInterp();
 
-            for (int k = 0; k < 11; ++k)
+            for (int k = 0; k < 14; ++k)
             {
                 const double ry = col3RowY(sliderRow(k));
                 if (y >= ry && y <= ry + 24.0 && x >= kSliderX - 8.0 && x <= kSliderX + kSliderW + 8.0)
@@ -707,6 +717,28 @@ protected:
 
             fmtTime(s.frel, vb, sizeof(vb));
             drawSlider("RELEASE", col3RowY(14), timeToFrac(s.frel), vb);
+        }
+
+        // Rows 15-18: tuning and LFO.
+        {
+            fontSize(14.0f);
+            fillColor(Color(100, 220, 140));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kCol3X, col3RowY(15) + 12.0f, "TUNING / LFO", nullptr);
+
+            char vb[24];
+
+            std::snprintf(vb, sizeof(vb), "%+.1f ct", s.fine * 100.0f);
+            drawSlider("FINE TUNE", col3RowY(16), (s.fine + 1.0f) * 0.5f, vb);
+
+            if (s.detune <= 0.0f)
+                std::snprintf(vb, sizeof(vb), "OFF");
+            else
+                std::snprintf(vb, sizeof(vb), "%.1f ct", s.detune);
+            drawSlider("DETUNE", col3RowY(17), s.detune / 100.0f, vb);
+
+            std::snprintf(vb, sizeof(vb), "%.1f Hz", s.lfoRate);
+            drawSlider("LFO SPEED", col3RowY(18), lfoToFrac(s.lfoRate), vb);
         }	
 
         fontSize(11.0f);
@@ -836,6 +868,21 @@ protected:
             repaint();
             return;
         }
+
+        if (index >= kPitchParam)
+        {
+            const uint32_t g = (index - kPitchParam) / 16;
+            const uint32_t s = (index - kPitchParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlot[s].fine    = value; break;
+            case 1: fSlot[s].detune  = value; break;
+            case 2: fSlot[s].lfoRate = value; break;
+            }
+            repaint();
+            return;
+        }      
 
         if (index >= kFEnvParam)
         {
@@ -1015,7 +1062,8 @@ private:
     bool interp = true;
     float cutoff = 20000.0f, res = 0.0f;
     float att = 0.002f, dec = 0.1f, sus = 1.0f, rel = 0.005f;
-    float fatt = 0.001f, fdec = 0.3f, fsus = 0.0f, frel = 0.3f, famt = 0.0f;    
+    float fatt = 0.001f, fdec = 0.3f, fsus = 0.0f, frel = 0.3f, famt = 0.0f;
+    float fine = 0.0f, detune = 0.0f, lfoRate = 5.0f;    
   };
 
     SlotInfo fSlot[16];
@@ -1031,15 +1079,21 @@ private:
 
     uint32_t sliderParam(int which) const
     {
-        if (which < 2) return kFilterParam + which * 16 + fSel;
-        if (which < 6) return kEnvParam + (which - 2) * 16 + fSel;
-
-        const int g = (which == 6) ? 4 : (which - 7); // amount is the 5th group
-        return kFEnvParam + g * 16 + fSel;
+        if (which < 2)  return kFilterParam + which * 16 + fSel;
+        if (which < 6)  return kEnvParam + (which - 2) * 16 + fSel;
+        if (which < 11)
+        {
+            const int g = (which == 6) ? 4 : (which - 7);
+            return kFEnvParam + g * 16 + fSel;
+        }
+        return kPitchParam + (which - 11) * 16 + fSel;
     }
 
-    static int sliderRow(int which) { return which < 2 ? which + 1 : which < 6 ? which + 3 : which + 4; }
-
+    static int sliderRow(int which)
+    {
+        return which < 2 ? which + 1 : which < 6 ? which + 3 : which < 11 ? which + 4 : which + 5;
+    }
+  
     void setSliderFromX(double x)
     {
         const float f = std::min(1.0f, std::max(0.0f,
@@ -1066,6 +1120,15 @@ private:
         case 8:  v = s.fdec   = fracToTime(f);                             break;
         case 9:  v = s.fsus   = f;                                         break;
         case 10: v = s.frel   = fracToTime(f);                             break;
+        case 11:
+        {
+            // 1/128 semitone steps, -1..+1 st, snaps to exactly 0 in the middle
+            const int n = static_cast<int>(std::floor((f * 2.0f - 1.0f) * 128.0f + 0.5f));
+            v = s.fine = static_cast<float>(n) / 128.0f;
+            break;
+        }
+        case 12: v = s.detune  = (f < 0.01f) ? 0.0f : f * 100.0f; break;
+        case 13: v = s.lfoRate = fracToLfo(f);                    break;	  
         default: return;
         }
 

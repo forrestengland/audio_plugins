@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(373, 0, 19),
+        : MidiMonitorPlugin(421, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,47 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kPitchParam)
+        {
+            static const char* const names[] = { "fine", "detune", "lfo-rate" };
+            static const char* const syms[]  = { "fine", "detune", "lfo_rate" };
+
+            const uint32_t g = (index - kPitchParam) / 16;
+            const uint32_t s = (index - kPitchParam) % 16;
+            if (g > 2) return;
+
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, names[g]);
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, syms[g]);
+            parameter.name   = name;
+            parameter.symbol = sym;
+            parameter.hints  = kParameterIsAutomatable;
+
+            if (g == 0)
+            {
+                parameter.unit       = "st";
+                parameter.ranges.min = -1.0f;
+                parameter.ranges.max = 1.0f;
+                parameter.ranges.def = 0.0f;
+            }
+            else if (g == 1)
+            {
+                parameter.unit       = "ct";
+                parameter.ranges.min = 0.0f;
+                parameter.ranges.max = 100.0f;
+                parameter.ranges.def = 0.0f;
+            }
+            else
+            {
+                parameter.hints      = kParameterIsAutomatable|kParameterIsLogarithmic;
+                parameter.unit       = "Hz";
+                parameter.ranges.min = 0.1f;
+                parameter.ranges.max = 20.0f;
+                parameter.ranges.def = 5.0f;
+            }
+            return;
+        }	
 
         if (index >= kFEnvParam)
         {
@@ -422,6 +463,20 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+        if (index >= kPitchParam)
+        {
+            const uint32_t g = (index - kPitchParam) / 16;
+            const uint32_t s = (index - kPitchParam) % 16;
+
+            switch (g)
+            {
+            case 0: return fSlots[s].fine.load();
+            case 1: return fSlots[s].detune.load();
+            case 2: return fSlots[s].lfoRate.load();
+            }
+            return 0.0f;
+        }	
+
         if (index >= kEnvParam)
         {
             const uint32_t g = (index - kEnvParam) / 16;
@@ -525,6 +580,20 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kPitchParam)
+        {
+            const uint32_t g = (index - kPitchParam) / 16;
+            const uint32_t s = (index - kPitchParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlots[s].fine.store(value);    break;
+            case 1: fSlots[s].detune.store(value);  break;
+            case 2: fSlots[s].lfoRate.store(value); break;
+            }
+            return;
+        }      
 
         if (index >= kFEnvParam)
         {
@@ -853,7 +922,10 @@ private:
         std::atomic<float> fenvDec { 0.3f };
         std::atomic<float> fenvSus { 0.0f };
         std::atomic<float> fenvRel { 0.3f };
-        std::atomic<float> fenvAmt { 0.0f };   // -1..+1, times 7 octaves      
+        std::atomic<float> fenvAmt { 0.0f };   // -1..+1, times 7 octaves
+        std::atomic<float> fine    { 0.0f };   // semitones, -1..+1
+        std::atomic<float> detune  { 0.0f };   // cents, 0..100
+        std::atomic<float> lfoRate { 5.0f };   // Hz      
     };
 
     Slot fSlots[kNumSlots];
@@ -874,7 +946,9 @@ private:
         float  ic1L = 0.0f, ic2L = 0.0f, ic1R = 0.0f, ic2R = 0.0f; // filter state
       int stage = 0; // 0 attack, 1 decay, 2 sustain - 'releasing' above sets release stage
         float  fenv   = 0.0f;
-        int    fstage = 0;     // 0 attack, 1 decay, 2 sustain      
+        int    fstage = 0;     // 0 attack, 1 decay, 2 sustain
+        double pos2     = 0.0;   // detuned copy
+        float  lfoPhase = 0.0f;  // 0..1      
     };
 
     SampleVoice fVoices[kNumVoices];
@@ -887,8 +961,13 @@ private:
     static constexpr uint32_t kInterpParam = 181; // 181..196 = slot interpolation  
                                                // 149..164 loop end, 165..180 loop on
     static constexpr uint32_t kFilterParam = 197; // 197..212 cutoff, 213..228 resonance
-    static constexpr uint32_t kEnvParam = 229; // 229 attack, 245 decay, 261 sustain, 277 release
-    static constexpr uint32_t kFEnvParam = 293; // attack, decay, sustain, release, amount (16 each)  
+    static constexpr uint32_t kEnvParam = 229; // 229 attack, 245 decay, 261 sustain, 277 release  
+    static constexpr uint32_t kFEnvParam = 293; // attack, decay, sustain, release, amount (16 each)
+    static constexpr uint32_t kPitchParam = 373; // fine, detune, lfo speed (16 each)
+    static constexpr float    kLfoMaxSemis = 1.0f; // vibrato depth at full mod wheel
+
+    float fModWheel  = 0.0f; // audio thread only
+    float fModSmooth = 0.0f;  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -953,10 +1032,19 @@ private:
         v->ic1L = v->ic2L = v->ic1R = v->ic2R = 0.0f;
 	v->stage = 0;
         v->fenv   = 0.0f;
-        v->fstage = 0;	
+        v->fstage = 0;
+        v->pos2     = v->pos;
+        v->lfoPhase = 0.0f;	
     }
+
     void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
     {
+        // smooth the mod wheel (once per segment) so depth changes don't zipper
+        fModSmooth += (fModWheel - fModSmooth)
+                    * std::min(1.0f, static_cast<float>(end - start) * 0.002f);
+
+        const float sr = static_cast<float>(getSampleRate());
+
         for (SampleVoice& v : fVoices)
         {
             if (!v.active)
@@ -982,12 +1070,6 @@ private:
             const bool looping = s.loopOn.load(std::memory_order_relaxed) && (le - ls) >= 2.0;
             const double loopLen = le - ls;
 
-            // ADSR rates: attack and decay are linear, release is exponential (-60 dB over the release time)
-            const float envSr   = static_cast<float>(getSampleRate());
-            const float susLvl  = std::min(1.0f, std::max(0.0f, s.sustain.load(std::memory_order_relaxed)));
-            const float attInc  = 1.0f / (std::max(0.001f, s.attack.load(std::memory_order_relaxed)) * envSr);
-            const float decDec  = (1.0f - susLvl) / (std::max(0.001f, s.decay.load(std::memory_order_relaxed)) * envSr);
-            const float relCoef = std::exp(-6.9f / (std::max(0.001f, s.release.load(std::memory_order_relaxed)) * envSr));
             const float slotGain = s.gainLin.load(std::memory_order_relaxed);
 
             const float qs = s.bit8.load(std::memory_order_relaxed) ? 128.0f : 32768.0f;
@@ -999,22 +1081,53 @@ private:
 
             const bool interp = s.interp.load(std::memory_order_relaxed);
 
-            // resonant low-pass (TPT state-variable filter). Bypassed only when fully
-            // open and the filter envelope is off.
+            // read one stereo frame at a fractional position (p must be < len - 1)
+            auto fetch = [&](double p, float& l, float& r) noexcept
+            {
+                const uint32_t idx  = static_cast<uint32_t>(p);
+                const float    frac = static_cast<float>(p - idx);
+
+                if (interp)
+                {
+                    const float l0 = quant(L[idx]), l1 = quant(L[idx + 1]);
+                    const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
+
+                    l = l0 + (l1 - l0) * frac;
+                    r = r0 + (r1 - r0) * frac;
+                }
+                else
+                {
+                    l = quant(L[idx]);
+                    r = quant(R[idx]);
+                }
+            };
+
+            // ---- pitch: fine tune, detuned copy, LFO vibrato ----
+            const float  fineSt   = s.fine.load(std::memory_order_relaxed);
+            const float  detuneSt = s.detune.load(std::memory_order_relaxed) * 0.01f;
+            const bool   dual     = detuneSt > 0.0005f;
+            const float  dualGain = dual ? 0.707f : 1.0f;
+            const float  lfoDepth = fModSmooth * kLfoMaxSemis;
+            const bool   lfoOn    = lfoDepth > 0.0005f;
+            const float  lfoInc   = s.lfoRate.load(std::memory_order_relaxed) / sr;
+
+            double ratio  = std::exp2(static_cast<double>(fineSt) / 12.0);
+            double ratio2 = std::exp2(static_cast<double>(fineSt + detuneSt) / 12.0);
+
+            // ---- filter ----
             const float cutoff = s.cutoff.load(std::memory_order_relaxed);
             const float fAmt   = s.fenvAmt.load(std::memory_order_relaxed);
             const bool  fMod   = std::fabs(fAmt) > 0.001f;
             const bool  filt   = fMod || cutoff < 19999.0f;
 
-            const float fSr    = static_cast<float>(getSampleRate());
-            const float fK     = 1.4f - 1.35f * s.res.load(std::memory_order_relaxed); // damping, Q ~0.7..20
-            const float fMaxHz = 0.45f * fSr;
+            const float fK     = 1.4f - 1.35f * s.res.load(std::memory_order_relaxed);
+            const float fMaxHz = 0.45f * sr;
             float fa1 = 0.0f, fa2 = 0.0f, fa3 = 0.0f;
 
             auto setCoef = [&](float hz) noexcept
             {
                 const float fc = std::min(fMaxHz, std::max(20.0f, hz));
-                const float g  = std::tan(3.14159265f * fc / fSr);
+                const float g  = std::tan(3.14159265f * fc / sr);
                 fa1 = 1.0f / (1.0f + g * (g + fK));
                 fa2 = g * fa1;
                 fa3 = g * fa2;
@@ -1023,15 +1136,21 @@ private:
             if (filt && !fMod)
                 setCoef(cutoff);
 
-            // filter envelope rates (same shapes as the amp envelope)
-            const float fSusLvl = std::min(1.0f, std::max(0.0f, s.fenvSus.load(std::memory_order_relaxed)));
-            const float fAttInc = 1.0f / (std::max(0.001f, s.fenvAtt.load(std::memory_order_relaxed)) * fSr);
-            const float fDecDec = (1.0f - fSusLvl) / (std::max(0.001f, s.fenvDec.load(std::memory_order_relaxed)) * fSr);
-            const float fRelCoef = std::exp(-6.9f / (std::max(0.001f, s.fenvRel.load(std::memory_order_relaxed)) * fSr));
-            int fCount = 0;	    
-	    
+            const float fSusLvl  = std::min(1.0f, std::max(0.0f, s.fenvSus.load(std::memory_order_relaxed)));
+            const float fAttInc  = 1.0f / (std::max(0.001f, s.fenvAtt.load(std::memory_order_relaxed)) * sr);
+            const float fDecDec  = (1.0f - fSusLvl) / (std::max(0.001f, s.fenvDec.load(std::memory_order_relaxed)) * sr);
+            const float fRelCoef = std::exp(-6.9f / (std::max(0.001f, s.fenvRel.load(std::memory_order_relaxed)) * sr));
+            int fCount = 0;
+
+            // ---- amp envelope ----
+            const float susLvl  = std::min(1.0f, std::max(0.0f, s.sustain.load(std::memory_order_relaxed)));
+            const float attInc  = 1.0f / (std::max(0.001f, s.attack.load(std::memory_order_relaxed)) * sr);
+            const float decDec  = (1.0f - susLvl) / (std::max(0.001f, s.decay.load(std::memory_order_relaxed)) * sr);
+            const float relCoef = std::exp(-6.9f / (std::max(0.001f, s.release.load(std::memory_order_relaxed)) * sr));
+
             for (uint32_t i = start; i < end; ++i)
             {
+                // amp envelope
                 if (v.releasing)
                 {
                     v.env *= relCoef;
@@ -1055,18 +1174,29 @@ private:
                 if (looping && v.pos >= le)
                     v.pos = ls + std::fmod(v.pos - ls, loopLen);
 
+                if (looping && dual && v.pos2 >= le)
+                    v.pos2 = ls + std::fmod(v.pos2 - ls, loopLen);
+
                 if ((!looping && v.pos >= endPos)
-		    || (v.releasing && v.env < 0.0005f)
-		    || (v.stage == 2 && susLvl < 0.0005f))
+                    || (v.releasing && v.env < 0.0005f)
+                    || (v.stage == 2 && susLvl < 0.0005f))
                 {
                     v.active = false;
                     break;
                 }
 
-                const uint32_t idx  = static_cast<uint32_t>(v.pos);
-                const float    frac = static_cast<float>(v.pos - idx);
-                const float    amp  = v.env * v.gain * slotGain;
+                // LFO (sine); the phase always runs, the depth comes from the mod wheel
+                if (lfoOn)
+                {
+                    const float m = std::sin(v.lfoPhase * 6.2831853f) * lfoDepth;
+                    ratio  = std::exp2(static_cast<double>(fineSt + m) / 12.0);
+                    ratio2 = std::exp2(static_cast<double>(fineSt + detuneSt + m) / 12.0);
+                }
+                v.lfoPhase += lfoInc;
+                if (v.lfoPhase >= 1.0f)
+                    v.lfoPhase -= 1.0f;
 
+                // filter envelope
                 if (fMod)
                 {
                     if (v.releasing)
@@ -1090,22 +1220,21 @@ private:
 
                     if ((fCount++ & 7) == 0)
                         setCoef(cutoff * std::exp2(fAmt * 7.0f * v.fenv));
-                }		
+                }
 
                 float l, r;
+                fetch(v.pos, l, r);
 
-                if (interp)
+                if (dual)
                 {
-                    const float l0 = quant(L[idx]), l1 = quant(L[idx + 1]);
-                    const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
+                    float l2 = 0.0f, r2 = 0.0f;
 
-                    l = l0 + (l1 - l0) * frac;
-                    r = r0 + (r1 - r0) * frac;
-                }
-                else
-                {
-                    l = quant(L[idx]);
-                    r = quant(R[idx]);
+                    // the detuned copy may reach the sample end before the main one
+                    if (looping || v.pos2 < endPos)
+                        fetch(v.pos2, l2, r2);
+
+                    l = (l + l2) * dualGain;
+                    r = (r + r2) * dualGain;
                 }
 
                 if (filt)
@@ -1123,15 +1252,21 @@ private:
                     v.ic1R = 2.0f * v1r - v.ic1R;
                     v.ic2R = 2.0f * v2r - v.ic2R;
                     r = v2r;
-                }		
+                }
 
+                const float amp = v.env * v.gain * slotGain;
                 outputs[0][i] += l * amp;
-                outputs[1][i] += r * amp;		
+                outputs[1][i] += r * amp;
 
-                v.pos += v.step;
+                v.pos += v.step * ratio;
+
+                if (dual)
+                    v.pos2 += v.step * ratio2;
+                else
+                    v.pos2 = v.pos; // stay in sync so detune can be switched on mid-note
             }
         }
-    }
+    }  
 
     void handleNote(const MidiEvent& ev, bool haveLock) noexcept
     {
@@ -1144,6 +1279,14 @@ private:
 
         const bool noteOn  = status == 0x90 && vel > 0;
         const bool noteOff = status == 0x80 || (status == 0x90 && vel == 0);
+
+        // mod wheel (CC1) sets the LFO depth
+        if (status == 0xB0)
+        {
+            if (note == 1)
+                fModWheel = vel / 127.0f;
+            return;
+        }	
 
         if (noteOn)
         {
