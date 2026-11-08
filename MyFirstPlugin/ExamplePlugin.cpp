@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(84, 0, 19),
+        : MidiMonitorPlugin(85, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -142,6 +142,15 @@ protected:
         parameter.ranges.min = 0.0f;
         parameter.ranges.max = 1.0f;
         parameter.ranges.def = 0.0f;
+
+        if (index == kLearnParam)
+        {
+            parameter.hints      = kParameterIsOutput|kParameterIsInteger;
+            parameter.name       = "learn-note";
+            parameter.symbol     = "learn_note";
+            parameter.ranges.max = 1048575.0f;
+            return;
+        }	
 
         if (index >= 4)
         {
@@ -254,6 +263,9 @@ protected:
     */
     float getParameterValue(uint32_t index) const override
     {
+        if (index == kLearnParam)
+            return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
+      
         if (index >= 4)
         {
             const uint32_t s = (index - 4) / 5;
@@ -533,6 +545,11 @@ private:
     SampleVoice fVoices[kNumVoices];
     uint32_t    fNextVoice = 0;
 
+    static constexpr uint32_t kLearnParam = 84;
+
+    std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
+    uint32_t fNoteSeq = 0;                 // audio thread only  
+
     bool trySampleLock() noexcept { return !fSampBusy.exchange(true, std::memory_order_acquire); }
     void sampleUnlock()  noexcept { fSampBusy.store(false, std::memory_order_release); }
 
@@ -648,6 +665,11 @@ private:
 
         if (noteOn)
         {
+            // publish the note for the UI's MIDI learn; the sequence number makes
+            // repeated presses of the same note look like a change
+            fNoteSeq = (fNoteSeq + 1) & 8191u;
+            fLearnVal.store(fNoteSeq * 128u + note, std::memory_order_relaxed);
+	  
             if (fAnySample.load(std::memory_order_relaxed))
             {
                 // Sampler mode: only slots whose key range contains the note play.

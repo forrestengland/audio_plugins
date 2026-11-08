@@ -15,6 +15,8 @@
 
 START_NAMESPACE_DISTRHO
 
+#define PLUGIN_TITLE "MALVERN"
+
 using DGL_NAMESPACE::Color;
 
 static const float kWaveTop = 252.0f;
@@ -31,6 +33,9 @@ static const float kSlotRowH = 22.0f;
 static const float kEditTop  = 440.0f;
 static const float kMinusX   = 520.0f;
 static const float kPlusX    = 700.0f;
+
+static const float    kLearnX     = 736.0f;
+static const uint32_t kLearnParam = 84;
 
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
 static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
@@ -113,6 +118,12 @@ protected:
 
                 if (x >= kMinusX && x <= kMinusX + 26.0) { adjustSlot(k + 1, -step); return true; }
                 if (x >= kPlusX  && x <= kPlusX  + 26.0) { adjustSlot(k + 1,  step); return true; }
+		if (x >= kLearnX && x <= kLearnX + 44.0f)
+                {
+                    fLearn = (fLearn == k + 1) ? -1 : k + 1; // click again to cancel
+                    repaint();
+                    return true;
+                }
             }
             return true;
         }	
@@ -397,6 +408,10 @@ protected:
             drawButton("-", kMinusX, y, 26.0f, 24.0f, Color(70, 70, 80));
             drawButton("+", kPlusX,  y, 26.0f, 24.0f, Color(70, 70, 80));
 
+            const bool armed = (fLearn == k + 1);
+            drawButton(armed ? "WAIT" : "LEARN", kLearnX, y, 44.0f, 24.0f,
+                       armed ? Color(200, 150, 40) : Color(70, 70, 80));	    
+
             char nb[8];
             noteLabel(vals[k], nb, sizeof(nb));
             std::snprintf(buf, sizeof(buf), "%s  (%d)", nb, vals[k]);
@@ -436,7 +451,7 @@ protected:
         fontSize(20.0f);
         fillColor(Color(255, 255, 255));
 
-        text(20, 25, "MY FIRST PLUGIN", nullptr);
+        text(20, 25, PLUGIN_TITLE, nullptr);
 
         // Monitor heading.
         fontSize(14.0f);
@@ -526,6 +541,14 @@ protected:
 
     void parameterChanged(uint32_t index, float value) override
     {
+
+      if (index == kLearnParam)
+        {
+            handleLearnValue(static_cast<int>(value + 0.5f));
+            repaint();
+            return;
+        }
+	      
         if (index >= 4)
         {
             const uint32_t s = (index - 4) / 5;
@@ -619,6 +642,27 @@ private:
     int      fSel      = 0;
     float    fWheelAcc = 0.0f;
 
+    int fLearn        = -1;  // -1 = off, else the field being learned (1 root, 2 low, 3 high)
+    int fLastLearnVal = -1;
+
+    void handleLearnValue(int v)
+    {
+        if (v == fLastLearnVal)
+            return;
+        fLastLearnVal = v;
+
+        if (fLearn < 0)
+            return;
+
+        const SlotInfo& s = fSlot[fSel];
+        const int cur  = (fLearn == 1) ? s.root : (fLearn == 2) ? s.lo : s.hi;
+        const int note = v % 128;
+        const int field = fLearn;
+
+        fLearn = -1;
+        adjustSlot(field, note - cur); // reuses the clamping and low <= high logic
+    }  
+
     static void noteLabel(int n, char* buf, size_t size)
     {
         static const char* const names[] = { "C", "C#", "D", "D#", "E", "F",
@@ -628,6 +672,7 @@ private:
 
     void selectSlot(int i)
     {
+      fLearn = -1;
         fSel = i;
         fPeakMin.clear();
         fPeakMax.clear();
