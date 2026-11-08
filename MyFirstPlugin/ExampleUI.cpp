@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <vector>
 #include <dirent.h>
+#include <sys/stat.h>
 
 START_NAMESPACE_DISTRHO
 
@@ -162,6 +163,14 @@ protected:
         // Right column: slot list and key-range editor.
         if (x >= kSlotX && x <= kSlotX + kSlotW)
         {
+
+            if (y >= 8.0 && y <= 28.0)
+            {
+                if (x >= kSlotX + 210.0 && x <= kSlotX + 280.0) savePreset();
+                if (x >= kSlotX + 290.0 && x <= kSlotX + 360.0) loadPreset();
+                return true;
+            }	  
+	  
             if (y >= kSlotTop && y < kSlotTop + 16 * kSlotRowH)
             {
                 selectSlot(static_cast<int>((y - kSlotTop) / kSlotRowH));
@@ -475,6 +484,9 @@ protected:
         fillColor(Color(100, 220, 140));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
         text(kSlotX, 30.0f, "SAMPLE SLOTS", nullptr);
+
+        drawButton("SAVE SET", kSlotX + 210.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));
+        drawButton("LOAD SET", kSlotX + 290.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));	
 
         beginPath();
         roundedRect(kSlotX, kSlotTop, kSlotW, kSlotRowH * 16, 4.0f);
@@ -862,6 +874,9 @@ protected:
     void parameterChanged(uint32_t index, float value) override
     {
 
+        if (index < kNumParams)
+            fParam[index] = value;      
+
       if (index == kLearnParam)
         {
             handleLearnValue(static_cast<int>(value + 0.5f));
@@ -1076,6 +1091,91 @@ private:
     int fDragMarker = -1; // -1 none, 0 start, 1 end, 2 loop start, 3 loop end
 
     int fDragSlider = -1; // -1 none, 0 cutoff, 1 resonance
+
+    static constexpr uint32_t kNumParams = 421;
+    float fParam[kNumParams] = {};
+
+    // outputs and the record toggle aren't part of a preset
+    static bool isOutputParam(uint32_t i)
+    {
+        return i == 1 || i == 2 || i == 3 || i == 84
+            || (i >= 4 && i < 84 && (i - 4) % 5 == 0);
+    }
+
+    std::string presetFolder() const { return samplesFolder() + "/presets"; }
+
+    void savePreset()
+    {
+        mkdir(samplesFolder().c_str(), 0755);
+        mkdir(presetFolder().c_str(), 0755);
+
+        const std::string path = presetFolder() + "/" + fName + ".mirage";
+        std::FILE* const f = std::fopen(path.c_str(), "w");
+
+        if (f == nullptr)
+        {
+            std::printf("Could not write %s\n", path.c_str());
+            return;
+        }
+
+        for (uint32_t i = 0; i < kNumParams; ++i)
+            if (!isOutputParam(i))
+                std::fprintf(f, "p %u %.6f\n", i, fParam[i]);
+
+        for (int n = 0; n < 16; ++n)
+            if (!fSlot[n].name.empty())
+                std::fprintf(f, "s %d %s\n", n + 1, fSlot[n].name.c_str());
+
+        std::fclose(f);
+        std::printf("Saved preset %s\n", path.c_str());
+    }
+
+    void loadPreset()
+    {
+        const std::string path = presetFolder() + "/" + fName + ".mirage";
+        std::FILE* const f = std::fopen(path.c_str(), "r");
+
+        if (f == nullptr)
+        {
+            std::printf("No preset %s\n", path.c_str());
+            return;
+        }
+
+        char line[512];
+
+        while (std::fgets(line, sizeof(line), f))
+        {
+            unsigned i = 0;
+            float    v = 0.0f;
+            int      n = 0;
+
+            if (std::sscanf(line, "p %u %f", &i, &v) == 3 - 1 && i < kNumParams && !isOutputParam(i))
+            {
+                setParameterValue(i, v);   // tell the plugin
+                parameterChanged(i, v);    // update the UI's own copy
+            }
+            else if (std::sscanf(line, "s %d", &n) == 1 && n >= 1 && n <= 16)
+            {
+                const char* p = line + 2;
+                while (*p >= '0' && *p <= '9') ++p;
+                if (*p == ' ') ++p;
+
+                std::string name = p;
+                while (!name.empty() && (name.back() == '\n' || name.back() == '\r'))
+                    name.pop_back();
+
+                if (!name.empty())
+                {
+                    fSlot[n - 1].name = name;
+                    setState(("slot" + std::to_string(n)).c_str(), name.c_str());
+                }
+            }
+        }
+
+        std::fclose(f);
+        selectSlot(fSel); // refresh the waveform for the current slot
+        std::printf("Loaded preset %s\n", path.c_str());
+    }  
 
     uint32_t sliderParam(int which) const
     {

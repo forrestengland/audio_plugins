@@ -40,4 +40,8 @@
 #define DISTRHO_PLUGIN_WANT_MIDI_INPUT 1
 #define DISTRHO_PLUGIN_WANT_DIRECT_ACCESS 1
 
+// In your DistrhoPluginInfo.h or constructor hints
+#define DISTRHO_PLUGIN_IS_SYNTH 1 
+
+
 #endif // DISTRHO_PLUGIN_INFO_H_INCLUDED
