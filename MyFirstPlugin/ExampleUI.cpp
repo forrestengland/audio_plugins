@@ -37,6 +37,8 @@ static const float kPlusX    = 700.0f;
 static const float    kLearnX     = 736.0f;
 static const uint32_t kLearnParam = 84;
 
+static const uint32_t kGainParam = 85;
+
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
 static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
 
@@ -125,6 +127,22 @@ protected:
                     return true;
                 }
             }
+
+            const double gy = editRowY(3);
+            if (y >= gy && y <= gy + 24.0)
+            {
+                const float gstep = (ev.mod & kModifierShift) ? 6.0f : 1.0f;
+
+                if (x >= kMinusX && x <= kMinusX + 26.0)
+                    adjustGain(-gstep);
+                else if (x >= kPlusX && x <= kPlusX + 26.0)
+                    adjustGain(gstep);
+                else if (x > kMinusX + 26.0 && x < kPlusX)
+                    adjustGain(-fSlot[fSel].gain); // reset to 0 dB
+
+                return true;
+            }	    
+	    
             return true;
         }	
 
@@ -218,6 +236,19 @@ protected:
                     return true;
                 }
             }
+
+            if (y >= editRowY(3) && y <= editRowY(3) + 24.0)
+            {
+                fWheelAcc += ev.delta.getY();
+                const int steps = static_cast<int>(fWheelAcc);
+
+                if (steps != 0)
+                {
+                    fWheelAcc -= static_cast<float>(steps);
+                    adjustGain(static_cast<float>(steps));
+                }
+                return true;
+            }	    
             return true;
         }	
 
@@ -422,10 +453,30 @@ protected:
             text((kMinusX + 26.0f + kPlusX) * 0.5f, y + 12.0f, buf, nullptr);
         }
 
+        {
+            const float gy = editRowY(3);
+
+            fontSize(12.0f);
+            fillColor(Color(220, 220, 225));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kSlotX, gy + 12.0f, "GAIN", nullptr);
+
+            drawButton("-", kMinusX, gy, 26.0f, 24.0f, Color(70, 70, 80));
+            drawButton("+", kPlusX,  gy, 26.0f, 24.0f, Color(70, 70, 80));
+
+            std::snprintf(buf, sizeof(buf), "%+.1f dB", s.gain);
+            fontSize(13.0f);
+            fillColor(Color(255, 255, 255));
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            text((kMinusX + 26.0f + kPlusX) * 0.5f, gy + 12.0f, buf, nullptr);
+        }
+
         fontSize(11.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(kSlotX, editRowY(2) + 44.0f, "Click +/-: 1 note   Shift-click: octave   Wheel: 1 note", nullptr);
+        text(kSlotX, editRowY(3) + 44.0f,
+             "Click +/-: 1 step (Shift: octave / 6 dB)   Wheel: 1 step   Click gain value: reset", nullptr);	
+
     }  
 
     void onNanoDisplay() override
@@ -548,6 +599,14 @@ protected:
             repaint();
             return;
         }
+
+        if (index >= kGainParam)
+        {
+            if (index - kGainParam < 16)
+                fSlot[index - kGainParam].gain = value;
+            repaint();
+            return;
+        }      
 	      
         if (index >= 4)
         {
@@ -636,6 +695,7 @@ private:
         std::string name;
         int   root = 60, lo = 0, hi = 127;
         float sec = 0.0f, start = 0.0f;
+      float gain = 0.0f;
     };
 
     SlotInfo fSlot[16];
@@ -682,6 +742,14 @@ private:
 
         repaint();
     }
+
+    void adjustGain(float delta)
+    {
+        float& g = fSlot[fSel].gain;
+        g = std::min(24.0f, std::max(-24.0f, g + delta));
+        setParameterValue(kGainParam + fSel, g);
+        repaint();
+    }  
 
     // field: 1 = root, 2 = key low, 3 = key high
     void adjustSlot(int field, int delta)

@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(85, 0, 19),
+        : MidiMonitorPlugin(101, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -150,6 +150,21 @@ protected:
             parameter.symbol     = "learn_note";
             parameter.ranges.max = 1048575.0f;
             return;
+        }
+
+        if (index >= kGainParam)
+        {
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-gain", index - kGainParam + 1);
+            std::snprintf(sym,  sizeof(sym),  "s%u_gain",    index - kGainParam + 1);
+            parameter.name       = name;
+            parameter.symbol     = sym;
+            parameter.hints      = kParameterIsAutomatable;
+            parameter.unit       = "dB";
+            parameter.ranges.min = -24.0f;
+            parameter.ranges.max = 24.0f;
+            parameter.ranges.def = 0.0f;
+            return;
         }	
 
         if (index >= 4)
@@ -265,6 +280,12 @@ protected:
     {
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
+
+        if (index >= kGainParam)
+        {
+            const uint32_t s = index - kGainParam;
+            return s < kNumSlots ? fSlots[s].gainDb.load() : 0.0f;
+        }	
       
         if (index >= 4)
         {
@@ -298,6 +319,18 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kGainParam)
+        {
+            const uint32_t s = index - kGainParam;
+            if (s < kNumSlots)
+            {
+                fSlots[s].gainDb.store(value);
+                fSlots[s].gainLin.store(std::pow(10.0f, value / 20.0f));
+            }
+            return;
+        }
+	
         if (index >= 4)
         {
             const uint32_t s = (index - 4) / 5;
@@ -523,6 +556,8 @@ private:
         std::atomic<int>   hi      { 127 };
         std::atomic<float> start   { 0.0f };
         std::atomic<float> seconds { 0.0f };
+        std::atomic<float> gainDb  { 0.0f };
+        std::atomic<float> gainLin { 1.0f };      
     };
 
     Slot fSlots[kNumSlots];
@@ -546,6 +581,7 @@ private:
     uint32_t    fNextVoice = 0;
 
     static constexpr uint32_t kLearnParam = 84;
+    static constexpr uint32_t kGainParam = 85; // 85..100 = slot gains  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -628,6 +664,7 @@ private:
             const float* const R = s.R.data();
             const double lastPos = static_cast<double>(s.len - 1);
             const float target   = v.releasing ? 0.0f : 1.0f;
+            const float slotGain = s.gainLin.load(std::memory_order_relaxed);
 
             for (uint32_t i = start; i < end; ++i)
             {
@@ -641,7 +678,7 @@ private:
 
                 const uint32_t idx  = static_cast<uint32_t>(v.pos);
                 const float    frac = static_cast<float>(v.pos - idx);
-                const float    amp  = v.env * v.gain;
+                const float    amp  = v.env * v.gain * slotGain;
 
                 outputs[0][i] += (L[idx] + (L[idx + 1] - L[idx]) * frac) * amp;
                 outputs[1][i] += (R[idx] + (R[idx + 1] - R[idx]) * frac) * amp;
