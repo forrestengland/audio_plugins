@@ -2,6 +2,7 @@
 
 #include "DistrhoPlugin.hpp"
 #include "MidiMonitor.hpp"
+#include "WaveReader.hpp"
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -32,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(5, 0, 4), // 3 parameters, 0 programs, 0 states
+        : MidiMonitorPlugin(6, 0, 4),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -184,6 +185,11 @@ protected:
             parameter.symbol = "sample_length";
             parameter.unit   = "s";
             parameter.ranges.max = 3600.0f;
+            break;
+        case 5:
+            parameter.hints  = kParameterIsAutomatable;
+            parameter.name   = "sample-start";
+            parameter.symbol = "sample_start";
             break;	    
         }
     }
@@ -218,6 +224,7 @@ protected:
         case 2: return fOutRight;
         case 3: return fRecording.load() ? 1.0f : 0.0f;
 	case 4: return fSampSeconds.load();
+	case 5: return fStart.load();
         }
 
         return 0.0f;
@@ -232,6 +239,7 @@ protected:
         {
         case 0: fColor = value; break;
         case 3: fRecording.store(value > 0.5f); break;
+	case 5: fStart.store(value); break;
         }
     }
 
@@ -421,6 +429,8 @@ private:
     static constexpr uint32_t kNumVoices = 8;
     static constexpr int      kRootNote  = 60; // C4 plays at original pitch
 
+  std::atomic<float> fStart {0.0f};
+
     struct SampleVoice
     {
         bool   active    = false;
@@ -461,7 +471,7 @@ private:
         v->active    = true;
         v->releasing = false;
         v->note      = note;
-        v->pos       = 0.0;
+        v->pos       = std::min(static_cast<double>(fStart.load(std::memory_order_relaxed)) * static_cast<double>(fSampLen - 1), static_cast<double>(fSampLen) - 2.0);
         v->step      = std::pow(2.0, (note - kRootNote) / 12.0)
                      * static_cast<double>(fSampRate) / getSampleRate();
         v->gain      = (vel / 127.0f) * 0.5f;
@@ -524,139 +534,6 @@ private:
         const char* home = std::getenv("HOME");
         if (home == nullptr) home = std::getenv("USERPROFILE");
         return std::string(home ? home : ".") + "/Samples";
-    }
-
-    // Reads 8/16/24/32-bit PCM or 32-bit float WAV. Mono is duplicated to both channels.
-    static bool readWav(const std::string& path,
-                        std::vector<float>& outL, std::vector<float>& outR,
-                        uint32_t& outRate)
-    {
-        std::FILE* const f = std::fopen(path.c_str(), "rb");
-        if (f == nullptr)
-            return false;
-
-        std::fseek(f, 0, SEEK_END);
-        const long size = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-
-        if (size < 44 || size > 64L * 1024 * 1024)
-        {
-            std::fclose(f);
-            return false;
-        }
-
-        std::vector<uint8_t> d(static_cast<size_t>(size));
-        const size_t got = std::fread(d.data(), 1, d.size(), f);
-        std::fclose(f);
-
-        if (got != d.size())
-            return false;
-
-        auto rd16 = [&d](size_t o) -> uint32_t
-        {
-            return uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8);
-        };
-        auto rd32 = [&d](size_t o) -> uint32_t
-        {
-            return uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8)
-                 | (uint32_t(d[o + 2]) << 16) | (uint32_t(d[o + 3]) << 24);
-        };
-
-        if (std::memcmp(&d[0], "RIFF", 4) != 0 || std::memcmp(&d[8], "WAVE", 4) != 0)
-            return false;
-
-        uint32_t format = 0, channels = 0, bits = 0, rate = 0;
-        size_t   dataOff = 0, dataSize = 0;
-        bool     haveFmt = false, haveData = false;
-
-        size_t p = 12;
-        while (p + 8 <= d.size())
-        {
-            const uint32_t csize = rd32(p + 4);
-            const size_t   body  = p + 8;
-
-            if (std::memcmp(&d[p], "fmt ", 4) == 0 && csize >= 16 && body + 16 <= d.size())
-            {
-                format   = rd16(body);
-                channels = rd16(body + 2);
-                rate     = rd32(body + 4);
-                bits     = rd16(body + 14);
-
-                // WAVE_FORMAT_EXTENSIBLE: the real format tag is in the sub-format
-                if (format == 0xFFFE && csize >= 26 && body + 26 <= d.size())
-                    format = rd16(body + 24);
-
-                haveFmt = true;
-            }
-            else if (std::memcmp(&d[p], "data", 4) == 0)
-            {
-                dataOff  = body;
-                dataSize = std::min<size_t>(csize, d.size() - body);
-                haveData = true;
-                break;
-            }
-
-            const uint64_t next = uint64_t(body) + csize + (csize & 1u);
-            if (next >= d.size())
-                break;
-            p = static_cast<size_t>(next);
-        }
-
-        const bool okFormat = (format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32))
-                           || (format == 3 && bits == 32);
-
-        if (!haveFmt || !haveData || !okFormat || channels < 1 || rate == 0)
-            return false;
-
-        const size_t bytes      = bits / 8;
-        const size_t frameBytes = bytes * channels;
-        const size_t frames     = dataSize / frameBytes;
-
-        if (frames < 2)
-            return false;
-
-        auto sampleAt = [&](size_t o) -> float
-        {
-            switch (bits)
-            {
-            case 8:
-                return (static_cast<int>(d[o]) - 128) / 128.0f;
-            case 16:
-                return static_cast<int16_t>(rd16(o)) / 32768.0f;
-            case 24:
-            {
-                int32_t v = static_cast<int32_t>(uint32_t(d[o]) | (uint32_t(d[o + 1]) << 8)
-                                               | (uint32_t(d[o + 2]) << 16));
-                if (v & 0x800000)
-                    v -= 0x1000000;
-                return v / 8388608.0f;
-            }
-            case 32:
-                if (format == 3)
-                {
-                    const uint32_t u = rd32(o);
-                    float x;
-                    std::memcpy(&x, &u, 4);
-                    return x;
-                }
-                return static_cast<int32_t>(rd32(o)) / 2147483648.0f;
-            }
-            return 0.0f;
-        };
-
-        outL.assign(frames, 0.0f);
-        outR.assign(frames, 0.0f);
-
-        for (size_t i = 0; i < frames; ++i)
-        {
-            const size_t o = dataOff + i * frameBytes;
-            const float  l = sampleAt(o);
-            outL[i] = l;
-            outR[i] = (channels > 1) ? sampleAt(o + bytes) : l;
-        }
-
-        outRate = rate;
-        return true;
     }
 
     // Called from setState(), which is not the audio thread.

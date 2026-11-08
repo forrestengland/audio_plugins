@@ -1,6 +1,7 @@
 
 #include "DistrhoUI.hpp"
 #include "MidiMonitor.hpp"
+#include "WaveReader.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -16,14 +17,17 @@ START_NAMESPACE_DISTRHO
 
 using DGL_NAMESPACE::Color;
 
-static const float kListTop = 258.0f; // y of the first row
+static const float kWaveTop = 252.0f;
+static const float kWaveH = 80.0f;
+static const uint32_t kPeakBins = 1024;
+static const float kListTop = 372.0f; // y of the first row
 static const float kRowH    = 18.0f;
 
 class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(400, 580),
+    : UI(400, 694),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -42,8 +46,20 @@ protected:
 
       bool onMouse(const MouseEvent& ev) override
     {
-        if (ev.button != 1 || !ev.press)
+        if (ev.button != 1)
             return false;
+
+        if (!ev.press)
+        {
+            // end of a start-point drag
+            if (fDraggingStart)
+            {
+                fDraggingStart = false;
+                editParameter(5, false);
+                return true;
+            }
+            return false;
+        }      
 
         const double x = ev.pos.getX();
         const double y = ev.pos.getY();
@@ -64,6 +80,16 @@ protected:
         {
             fEditing = false;
             repaint();
+        }
+
+	// Waveform: click or drag to set the start point.
+        if (!fPeakMin.empty() && x >= 20 && x <= getWidth() - 20
+                              && y >= kWaveTop && y <= kWaveTop + kWaveH)
+        {
+            fDraggingStart = true;
+            editParameter(5, true); // tells the host a gesture started
+            setStartFromX(x);
+            return true;
         }
 
         // File list: click to select a row.
@@ -104,13 +130,24 @@ protected:
 
         if (x >= 240 && x <= 340)
         {
-            if (!fSelected.empty())
-                setState("load", fSelected.c_str());
-            return true;
+	  if (!fSelected.empty()) {
+	    fPendingLoad = fSelected;
+	    setState("load", fSelected.c_str());
+	  }
+	  return true;
         }	
 
         return false;
     }
+
+    bool onMotion(const MotionEvent& ev) override
+    {
+        if (!fDraggingStart)
+            return false;
+
+        setStartFromX(ev.pos.getX());
+        return true;
+    }  
 
     bool onScroll(const ScrollEvent& ev) override
     {
@@ -300,6 +337,7 @@ protected:
             }
         }
 
+	drawWaveform(width);
 	drawFileList(width);
 
         drawTextField(20, height - 148.0f, width - 40.0f, 24.0f);	
@@ -329,7 +367,14 @@ protected:
         case 1: fLevelL = value; break;
         case 2: fLevelR = value; break;
 	case 3: fRecording = value > 0.5f; break;
-	case 4: fSampSec = value; break;
+	case 4:
+	  fSampSec = value;
+	  if (value > 0.0f && !fPendingLoad.empty()) {
+	    loadPeaks(fPendingLoad);
+	    fPendingLoad.clear();
+	  }
+	  break;
+	case 5: fStartFrac = value; break;
         }
 
         repaint();
@@ -346,7 +391,9 @@ protected:
         {
             fFolder = value;
             scanSamples();
-        }
+        } else if (std::strcmp(key, "load") == 0) {
+	  loadPeaks(value);
+	}
     }
 
 private:
@@ -371,7 +418,178 @@ private:
     float fScrollAcc = 0.0f;
     int   fScanTick  = 0;
 
-    float fSampSec = 0.0f;  
+    float fSampSec = 0.0f;
+
+    std::vector<float> fPeakMin, fPeakMax;
+    std::string fLoadedName, fPendingLoad;
+    float fStartFrac     = 0.0f;
+    bool  fDraggingStart = false;
+
+    void setStartFromX(double x)
+    {
+        const float f = (static_cast<float>(x) - 20.0f) / (getWidth() - 40.0f);
+        fStartFrac = std::min(1.0f, std::max(0.0f, f));
+        setParameterValue(5, fStartFrac);
+        repaint();
+    }
+
+    // Reads the loaded file and reduces it to min/max pairs for drawing.
+    void loadPeaks(const std::string& name)
+    {
+        fPeakMin.clear();
+        fPeakMax.clear();
+        fLoadedName.clear();
+
+        if (name.empty() || name.find('/') != std::string::npos
+                         || name.find('\\') != std::string::npos
+                         || name.find("..") != std::string::npos)
+        {
+            repaint();
+            return;
+        }
+
+        std::vector<float> L, R;
+        uint32_t rate = 0;
+
+        if (!readWav(samplesFolder() + "/" + name, L, R, rate))
+        {
+            repaint();
+            return;
+        }
+
+        const size_t len  = L.size();
+        const size_t bins = std::min<size_t>(kPeakBins, len);
+
+        fPeakMin.assign(bins, 0.0f);
+        fPeakMax.assign(bins, 0.0f);
+
+        for (size_t b = 0; b < bins; ++b)
+        {
+            const size_t s0 = b * len / bins;
+            size_t       s1 = (b + 1) * len / bins;
+            if (s1 <= s0) s1 = s0 + 1;
+
+            float lo = L[s0], hi = L[s0];
+            for (size_t i = s0; i < s1; ++i)
+            {
+                lo = std::min({lo, L[i], R[i]});
+                hi = std::max({hi, L[i], R[i]});
+            }
+            fPeakMin[b] = lo;
+            fPeakMax[b] = hi;
+        }
+
+        fLoadedName = name;
+        repaint();
+    }
+
+    void drawWaveform(float width)
+    {
+        const float x = 20.0f;
+        const float w = width - 40.0f;
+        const float y = kWaveTop;
+        const float h = kWaveH;
+
+        // Header: title on the left, start time on the right.
+        fontSize(14.0f);
+        fillColor(Color(100, 220, 140));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x, y - 14.0f, "WAVEFORM", nullptr);
+
+        if (!fPeakMin.empty())
+        {
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "START %.3f s", fStartFrac * fSampSec);
+
+            fontSize(12.0f);
+            fillColor(Color(140, 140, 150));
+            textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
+            text(x + w, y - 14.0f, buf, nullptr);
+        }
+
+        // Panel.
+        beginPath();
+        roundedRect(x, y, w, h, 4.0f);
+        fillColor(Color(40, 40, 46));
+        fill();
+
+        if (fPeakMin.empty())
+        {
+            fontSize(13.0f);
+            fillColor(Color(140, 140, 150));
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            text(x + w * 0.5f, y + h * 0.5f, "Load a sample to see its waveform", nullptr);
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            return;
+        }
+
+        const float mid = y + h * 0.5f;
+        const float amp = h * 0.5f - 4.0f;
+
+        // Center line.
+        beginPath();
+        moveTo(x, mid);
+        lineTo(x + w, mid);
+        strokeColor(Color(70, 70, 80));
+        strokeWidth(1.0f);
+        stroke();
+
+        // One vertical line per pixel column, spanning that column's min..max.
+        const int    cols = std::max(1, static_cast<int>(w));
+        const size_t bins = fPeakMin.size();
+
+        beginPath();
+        for (int c = 0; c < cols; ++c)
+        {
+            const size_t b0 = static_cast<size_t>(c) * bins / cols;
+            size_t       b1 = static_cast<size_t>(c + 1) * bins / cols;
+            if (b1 <= b0)   b1 = b0 + 1;
+            if (b1 > bins)  b1 = bins;
+
+            float lo = fPeakMin[b0], hi = fPeakMax[b0];
+            for (size_t b = b0; b < b1; ++b)
+            {
+                lo = std::min(lo, fPeakMin[b]);
+                hi = std::max(hi, fPeakMax[b]);
+            }
+            lo = std::max(-1.0f, lo);
+            hi = std::min( 1.0f, hi);
+
+            const float px     = x + c + 0.5f;
+            const float top    = mid - hi * amp;
+            const float bottom = std::max(mid - lo * amp, top + 1.0f);
+
+            moveTo(px, top);
+            lineTo(px, bottom);
+        }
+        strokeColor(Color(100, 220, 140));
+        strokeWidth(1.0f);
+        stroke();
+
+        // Dim the part before the start point, since it will be skipped.
+        const float sx = x + w * fStartFrac;
+
+        beginPath();
+        rect(x, y, sx - x, h);
+        fillColor(0, 0, 0, 120);
+        fill();
+
+        // Start marker with a small handle at the top.
+        beginPath();
+        moveTo(sx, y);
+        lineTo(sx, y + h);
+        strokeColor(Color(255, 200, 80));
+        strokeWidth(2.0f);
+        stroke();
+
+        beginPath();
+        moveTo(sx, y);
+        lineTo(sx + 9.0f, y);
+        lineTo(sx, y + 9.0f);
+        closePath();
+        fillColor(Color(255, 200, 80));
+        fill();
+    }  
 
     float listBottom() const { return getHeight() - 160.0f; }
 
