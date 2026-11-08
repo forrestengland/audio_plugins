@@ -43,6 +43,11 @@ static const uint32_t kBitParam = 101;
 
 static const uint32_t kEndParam = 117; // end, then loop start, loop end, loop on (16 each)
 
+static const uint32_t kInterpParam = 181;
+static const float kCol3X = 820.0f;
+static const float kCol3W = 360.0f;
+static float col3RowY(int k) { return kSlotTop + k * 34.0f; }
+
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
 static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
 
@@ -50,7 +55,7 @@ class MyFirstUI : public UI
 {
 public:
   MyFirstUI()
-    : UI(800, 694),
+    : UI(1200, 694),
       fMidiMonitor(nullptr),
       fEventCount(0)
   {
@@ -163,6 +168,16 @@ protected:
                 return true;
             }	    
 	    
+            return true;
+        }
+
+        // Third column: more slot settings.
+        if (x >= kCol3X && x <= kCol3X + kCol3W)
+        {
+            const double iy = col3RowY(0);
+            if (y >= iy && y <= iy + 24.0 && x >= kCol3X + 130.0)
+                toggleInterp();
+
             return true;
         }	
 
@@ -541,6 +556,37 @@ protected:
         text(kSlotX, editRowY(5) + 40.0f,
              "Click +/-: 1 step (Shift: octave / 6 dB)   Wheel: 1 step   Click gain value: reset", nullptr);	
 
+    }
+
+    void drawCol3()
+    {
+        const SlotInfo& s = fSlot[fSel];
+
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "SLOT %d PLAYBACK", fSel + 1);
+
+        fontSize(14.0f);
+        fillColor(Color(100, 220, 140));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kCol3X, 30.0f, buf, nullptr);
+
+        // Row 0: interpolation.
+        {
+            const float y = col3RowY(0);
+
+            fontSize(12.0f);
+            fillColor(Color(220, 220, 225));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kCol3X, y + 12.0f, "INTERPOLATION", nullptr);
+
+            drawButton(s.interp ? "LINEAR" : "OFF", kCol3X + 130.0f, y, 200.0f, 24.0f,
+                       s.interp ? Color(70, 70, 80) : Color(200, 150, 40));
+        }
+
+        fontSize(11.0f);
+        fillColor(Color(140, 140, 150));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kCol3X, col3RowY(1) + 4.0f, "Click to toggle. OFF = nearest sample (stepped, aliased).", nullptr);
     }  
 
     void onNanoDisplay() override
@@ -629,6 +675,7 @@ protected:
 
 	drawSlots();
 	drawEditor();
+	drawCol3();
 
 	drawWaveform(width);
 	drawFileList(width);
@@ -663,6 +710,14 @@ protected:
             repaint();
             return;
         }
+
+        if (index >= kInterpParam)
+        {
+            if (index - kInterpParam < 16)
+                fSlot[index - kInterpParam].interp = value > 0.5f;
+            repaint();
+            return;
+        }      
 
         if (index >= kEndParam)
         {
@@ -785,7 +840,8 @@ private:
       float gain = 0.0f;
       bool bit8 = false;
         float endPt = 1.0f, loopStart = 0.0f, loopEnd = 1.0f;
-        bool  loopOn = false;      
+        bool  loopOn = false;
+      bool interp = true;
     };
 
     SlotInfo fSlot[16];
@@ -853,6 +909,14 @@ private:
 
         repaint();
     }
+
+    void toggleInterp()
+    {
+        bool& b = fSlot[fSel].interp;
+        b = !b;
+        setParameterValue(kInterpParam + fSel, b ? 1.0f : 0.0f);
+        repaint();
+    }  
 
     void toggleBit()
     {

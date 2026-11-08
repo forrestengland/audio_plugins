@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(181, 0, 19),
+        : MidiMonitorPlugin(197, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,18 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kInterpParam)
+        {
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-interp", index - kInterpParam + 1);
+            std::snprintf(sym,  sizeof(sym),  "s%u_interp",    index - kInterpParam + 1);
+            parameter.name       = name;
+            parameter.symbol     = sym;
+            parameter.hints      = kParameterIsAutomatable|kParameterIsBoolean;
+            parameter.ranges.def = 1.0f; // linear
+            return;
+        }	
 
         if (index >= kEndParam)
         {
@@ -313,6 +325,12 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+        if (index >= kInterpParam)
+        {
+            const uint32_t s = index - kInterpParam;
+            return (s < kNumSlots && fSlots[s].interp.load()) ? 1.0f : 0.0f;
+        }	
+
 	if (index >= kEndParam)
         {
             const uint32_t g = (index - kEndParam) / 16;
@@ -372,6 +390,14 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kInterpParam)
+        {
+            const uint32_t s = index - kInterpParam;
+            if (s < kNumSlots)
+                fSlots[s].interp.store(value > 0.5f);
+            return;
+        }      
 
         if (index >= kEndParam)
         {
@@ -638,7 +664,8 @@ private:
         std::atomic<float> endPt     { 1.0f };
         std::atomic<float> loopStart { 0.0f };
         std::atomic<float> loopEnd   { 1.0f };
-        std::atomic<bool>  loopOn    { false };      
+        std::atomic<bool>  loopOn    { false };
+        std::atomic<bool> interp { true }; // true = linear, false = nearest sample      
     };
 
     Slot fSlots[kNumSlots];
@@ -665,6 +692,7 @@ private:
     static constexpr uint32_t kGainParam = 85; // 85..100 = slot gains
   static constexpr uint32_t kBitParam = 101; // 101..116 = slot 8-bit toggles
     static constexpr uint32_t kEndParam = 117; // 117..132 end, 133..148 loop start,
+    static constexpr uint32_t kInterpParam = 181; // 181..196 = slot interpolation  
                                                // 149..164 loop end, 165..180 loop on  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
@@ -765,6 +793,7 @@ private:
                 return std::min(qs - 1.0f, std::max(-qs, q)) / qs;
             };
 
+            const bool interp = s.interp.load(std::memory_order_relaxed);	    
             for (uint32_t i = start; i < end; ++i)
             {
                 v.env += (target - v.env) * 0.01f;
@@ -783,11 +812,24 @@ private:
                 const float    frac = static_cast<float>(v.pos - idx);
                 const float    amp  = v.env * v.gain * slotGain;
 
-                const float l0 = quant(L[idx]), l1 = quant(L[idx + 1]);
-                const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
+                float l, r;
 
-                outputs[0][i] += (l0 + (l1 - l0) * frac) * amp;
-                outputs[1][i] += (r0 + (r1 - r0) * frac) * amp;
+                if (interp)
+                {
+                    const float l0 = quant(L[idx]), l1 = quant(L[idx + 1]);
+                    const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
+
+                    l = l0 + (l1 - l0) * frac;
+                    r = r0 + (r1 - r0) * frac;
+                }
+                else
+                {
+                    l = quant(L[idx]);
+                    r = quant(R[idx]);
+                }
+
+                outputs[0][i] += l * amp;
+                outputs[1][i] += r * amp;		
 
                 v.pos += v.step;
             }
