@@ -1095,6 +1095,15 @@ private:
     static constexpr uint32_t kNumParams = 421;
     float fParam[kNumParams] = {};
 
+    // Every UI-originated parameter change also goes into the preset cache.
+    void setParameterValue(uint32_t index, float value)
+    {
+        if (index < kNumParams)
+            fParam[index] = value;
+
+        UI::setParameterValue(index, value);
+    }  
+
     // outputs and the record toggle aren't part of a preset
     static bool isOutputParam(uint32_t i)
     {
