@@ -46,6 +46,18 @@ static const uint32_t kEndParam = 117; // end, then loop start, loop end, loop o
 static const uint32_t kInterpParam = 181;
 static const float kCol3X = 820.0f;
 static const float kCol3W = 360.0f;
+
+static const uint32_t kFilterParam = 197;
+static const float kSliderX = 950.0f;  // kCol3X + 130
+static const float kSliderW = 150.0f;
+
+static float cutoffToFrac(float hz)
+{
+    hz = std::min(20000.0f, std::max(20.0f, hz));
+    return std::log(hz / 20.0f) / std::log(1000.0f);
+}
+static float fracToCutoff(float f) { return 20.0f * std::pow(1000.0f, f); }
+
 static float col3RowY(int k) { return kSlotTop + k * 34.0f; }
 
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
@@ -86,6 +98,14 @@ protected:
                 fDragMarker = -1;
                 return true;
             }
+
+            if (fDragSlider >= 0)
+            {
+                editParameter(sliderParam(fDragSlider), false);
+                fDragSlider = -1;
+                return true;
+            }	    
+	    
             return false;
         }
 	
@@ -178,6 +198,18 @@ protected:
             if (y >= iy && y <= iy + 24.0 && x >= kCol3X + 130.0)
                 toggleInterp();
 
+            for (int k = 0; k < 2; ++k)
+            {
+                const double ry = col3RowY(k + 1);
+                if (y >= ry && y <= ry + 24.0 && x >= kSliderX - 8.0 && x <= kSliderX + kSliderW + 8.0)
+                {
+                    fDragSlider = k;
+                    editParameter(sliderParam(k), true);
+                    setSliderFromX(x);
+                    return true;
+                }
+            }	    
+
             return true;
         }	
 
@@ -256,11 +288,19 @@ protected:
 
     bool onMotion(const MotionEvent& ev) override
     {
-        if (fDragMarker < 0)
-            return false;
+        if (fDragSlider >= 0)
+        {
+            setSliderFromX(ev.pos.getX());
+            return true;
+        }
 
-        setMarkerFromX(ev.pos.getX());
-        return true;
+        if (fDragMarker >= 0)
+        {
+            setMarkerFromX(ev.pos.getX());
+            return true;
+        }
+
+        return false;
     }  
 
     bool onScroll(const ScrollEvent& ev) override
@@ -583,10 +623,27 @@ protected:
                        s.interp ? Color(70, 70, 80) : Color(200, 150, 40));
         }
 
+        // Rows 1-2: low-pass filter.
+        {
+            char vb[24];
+
+            if (s.cutoff >= 19999.0f)
+                std::snprintf(vb, sizeof(vb), "OPEN");
+            else if (s.cutoff >= 1000.0f)
+                std::snprintf(vb, sizeof(vb), "%.2f kHz", s.cutoff / 1000.0f);
+            else
+                std::snprintf(vb, sizeof(vb), "%.0f Hz", s.cutoff);
+
+            drawSlider("CUTOFF", col3RowY(1), cutoffToFrac(s.cutoff), vb);
+
+            std::snprintf(vb, sizeof(vb), "%.0f%%", s.res * 100.0f);
+            drawSlider("RESONANCE", col3RowY(2), s.res, vb);
+        }
+
         fontSize(11.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(kCol3X, col3RowY(1) + 4.0f, "Click to toggle. OFF = nearest sample (stepped, aliased).", nullptr);
+        text(kCol3X, col3RowY(3) + 4.0f, "Drag sliders. Cutoff fully right = filter off.", nullptr);	
     }  
 
     void onNanoDisplay() override
@@ -711,6 +768,18 @@ protected:
             return;
         }
 
+        if (index >= kFilterParam)
+        {
+            const uint32_t g = (index - kFilterParam) / 16;
+            const uint32_t s = (index - kFilterParam) % 16;
+
+            if (g == 0)      fSlot[s].cutoff = value;
+            else if (g == 1) fSlot[s].res    = value;
+
+            repaint();
+            return;
+        }      
+
         if (index >= kInterpParam)
         {
             if (index - kInterpParam < 16)
@@ -830,19 +899,20 @@ private:
     float fScrollAcc = 0.0f;
     int   fScanTick  = 0;
 
-    std::vector<float> fPeakMin, fPeakMax;
+    std::vector<float> fPeakMin, fPeakMax;  
 
   struct SlotInfo
-    {
-        std::string name;
-        int   root = 60, lo = 0, hi = 127;
-        float sec = 0.0f, start = 0.0f;
-      float gain = 0.0f;
-      bool bit8 = false;
-        float endPt = 1.0f, loopStart = 0.0f, loopEnd = 1.0f;
-        bool  loopOn = false;
-      bool interp = true;
-    };
+  {
+    std::string name;
+    int   root = 60, lo = 0, hi = 127;
+    float sec = 0.0f, start = 0.0f;
+    float gain = 0.0f;
+    bool bit8 = false;
+    float endPt = 1.0f, loopStart = 0.0f, loopEnd = 1.0f;
+    bool  loopOn = false;
+    bool interp = true;
+    float cutoff = 20000.0f, res = 0.0f;      
+  };
 
     SlotInfo fSlot[16];
     int      fSel      = 0;
@@ -852,6 +922,55 @@ private:
     int fLastLearnVal = -1;
 
     int fDragMarker = -1; // -1 none, 0 start, 1 end, 2 loop start, 3 loop end
+
+    int fDragSlider = -1; // -1 none, 0 cutoff, 1 resonance
+
+    uint32_t sliderParam(int which) const { return kFilterParam + which * 16 + fSel; }
+
+    void setSliderFromX(double x)
+    {
+        const float f = std::min(1.0f, std::max(0.0f,
+                            (static_cast<float>(x) - kSliderX) / kSliderW));
+        SlotInfo& s = fSlot[fSel];
+
+        if (fDragSlider == 0)
+        {
+            s.cutoff = (f >= 0.99f) ? 20000.0f : fracToCutoff(f); // snap fully open
+            setParameterValue(sliderParam(0), s.cutoff);
+        }
+        else if (fDragSlider == 1)
+        {
+            s.res = f;
+            setParameterValue(sliderParam(1), s.res);
+        }
+        repaint();
+    }
+
+    void drawSlider(const char* label, float y, float frac, const char* value)
+    {
+        fontSize(12.0f);
+        fillColor(Color(220, 220, 225));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(kCol3X, y + 12.0f, label, nullptr);
+
+        beginPath();
+        roundedRect(kSliderX, y + 9.0f, kSliderW, 6.0f, 3.0f);
+        fillColor(Color(50, 50, 58));
+        fill();
+
+        beginPath();
+        roundedRect(kSliderX, y + 9.0f, kSliderW * frac, 6.0f, 3.0f);
+        fillColor(Color(100, 220, 140));
+        fill();
+
+        beginPath();
+        circle(kSliderX + kSliderW * frac, y + 12.0f, 7.0f);
+        fillColor(Color(235, 235, 240));
+        fill();
+
+        fillColor(Color(255, 255, 255));
+        text(kSliderX + kSliderW + 16.0f, y + 12.0f, value, nullptr);
+    }  
 
     uint32_t markerParam(int m) const
     {

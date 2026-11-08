@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(197, 0, 19),
+        : MidiMonitorPlugin(229, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,33 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kFilterParam)
+        {
+            const uint32_t g = (index - kFilterParam) / 16;
+            const uint32_t s = (index - kFilterParam) % 16;
+            if (g > 1) return;
+
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, g == 0 ? "cutoff" : "resonance");
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, g == 0 ? "cutoff" : "resonance");
+            parameter.name   = name;
+            parameter.symbol = sym;
+
+            if (g == 0)
+            {
+                parameter.hints      = kParameterIsAutomatable|kParameterIsLogarithmic;
+                parameter.unit       = "Hz";
+                parameter.ranges.min = 20.0f;
+                parameter.ranges.max = 20000.0f;
+                parameter.ranges.def = 20000.0f;
+            }
+            else
+            {
+                parameter.hints = kParameterIsAutomatable; // 0..1, default 0
+            }
+            return;
+        }	
 
         if (index >= kInterpParam)
         {
@@ -325,6 +352,13 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+        if (index >= kFilterParam)
+        {
+            const uint32_t g = (index - kFilterParam) / 16;
+            const uint32_t s = (index - kFilterParam) % 16;
+            return g == 0 ? fSlots[s].cutoff.load() : fSlots[s].res.load();
+        }
+	
         if (index >= kInterpParam)
         {
             const uint32_t s = index - kInterpParam;
@@ -390,6 +424,16 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kFilterParam)
+        {
+            const uint32_t g = (index - kFilterParam) / 16;
+            const uint32_t s = (index - kFilterParam) % 16;
+
+            if (g == 0) fSlots[s].cutoff.store(value);
+            else        fSlots[s].res.store(value);
+            return;
+        }      
 
         if (index >= kInterpParam)
         {
@@ -665,7 +709,9 @@ private:
         std::atomic<float> loopStart { 0.0f };
         std::atomic<float> loopEnd   { 1.0f };
         std::atomic<bool>  loopOn    { false };
-        std::atomic<bool> interp { true }; // true = linear, false = nearest sample      
+        std::atomic<bool> interp { true }; // true = linear, false = nearest sample
+        std::atomic<float> cutoff { 20000.0f };
+        std::atomic<float> res    { 0.0f };      
     };
 
     Slot fSlots[kNumSlots];
@@ -683,6 +729,7 @@ private:
         double step      = 0.0;
         float  gain      = 0.0f;
         float  env       = 0.0f;
+        float  ic1L = 0.0f, ic2L = 0.0f, ic1R = 0.0f, ic2R = 0.0f; // filter state      
     };
 
     SampleVoice fVoices[kNumVoices];
@@ -693,7 +740,8 @@ private:
   static constexpr uint32_t kBitParam = 101; // 101..116 = slot 8-bit toggles
     static constexpr uint32_t kEndParam = 117; // 117..132 end, 133..148 loop start,
     static constexpr uint32_t kInterpParam = 181; // 181..196 = slot interpolation  
-                                               // 149..164 loop end, 165..180 loop on  
+                                               // 149..164 loop end, 165..180 loop on
+    static constexpr uint32_t kFilterParam = 197; // 197..212 cutoff, 213..228 resonance  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -755,6 +803,7 @@ private:
         v->gain      = (vel / 127.0f) * 0.5f;
         if (!stolen)
             v->env   = 0.0f;
+        v->ic1L = v->ic2L = v->ic1R = v->ic2R = 0.0f;	
     }
     void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
     {
@@ -793,7 +842,25 @@ private:
                 return std::min(qs - 1.0f, std::max(-qs, q)) / qs;
             };
 
-            const bool interp = s.interp.load(std::memory_order_relaxed);	    
+            const bool interp = s.interp.load(std::memory_order_relaxed);
+
+            // resonant low-pass (TPT state-variable filter); fully open = bypass
+            const float cutoff = s.cutoff.load(std::memory_order_relaxed);
+            const bool  filt   = cutoff < 19999.0f;
+            float fa1 = 0.0f, fa2 = 0.0f, fa3 = 0.0f;
+
+            if (filt)
+            {
+                const float sr = static_cast<float>(getSampleRate());
+                const float fc = std::min(cutoff, 0.45f * sr);
+                const float g  = std::tan(3.14159265f * fc / sr);
+                const float k  = 1.4f - 1.35f * s.res.load(std::memory_order_relaxed); // damping, Q ~0.7..20
+
+                fa1 = 1.0f / (1.0f + g * (g + k));
+                fa2 = g * fa1;
+                fa3 = g * fa2;
+            }
+	    
             for (uint32_t i = start; i < end; ++i)
             {
                 v.env += (target - v.env) * 0.01f;
@@ -827,6 +894,23 @@ private:
                     l = quant(L[idx]);
                     r = quant(R[idx]);
                 }
+
+                if (filt)
+                {
+                    const float v3l = l - v.ic2L;
+                    const float v1l = fa1 * v.ic1L + fa2 * v3l;
+                    const float v2l = v.ic2L + fa2 * v.ic1L + fa3 * v3l;
+                    v.ic1L = 2.0f * v1l - v.ic1L;
+                    v.ic2L = 2.0f * v2l - v.ic2L;
+                    l = v2l;
+
+                    const float v3r = r - v.ic2R;
+                    const float v1r = fa1 * v.ic1R + fa2 * v3r;
+                    const float v2r = v.ic2R + fa2 * v.ic1R + fa3 * v3r;
+                    v.ic1R = 2.0f * v1r - v.ic1R;
+                    v.ic2R = 2.0f * v2r - v.ic2R;
+                    r = v2r;
+                }		
 
                 outputs[0][i] += l * amp;
                 outputs[1][i] += r * amp;		
