@@ -41,6 +41,8 @@ static const uint32_t kGainParam = 85;
 
 static const uint32_t kBitParam = 101;
 
+static const uint32_t kEndParam = 117; // end, then loop start, loop end, loop on (16 each)
+
 static float editRowY(int k) { return kEditTop + 30.0f + k * 34.0f; }
 static uint32_t slotParam(int slot, int field) { return 4u + slot * 5u + field; }
 
@@ -72,16 +74,16 @@ protected:
 
         if (!ev.press)
         {
-            // end of a start-point drag
-            if (fDraggingStart)
+            // end of a marker drag
+            if (fDragMarker >= 0)
             {
-                fDraggingStart = false;
-                editParameter(slotParam(fSel, 4), false);
+                editParameter(markerParam(fDragMarker), false);
+                fDragMarker = -1;
                 return true;
             }
             return false;
-        }      
-
+        }
+	
         const double x = ev.pos.getX();
         const double y = ev.pos.getY();
 
@@ -151,20 +153,42 @@ protected:
                 if (x >= kMinusX && x <= kPlusX + 26.0)
                     toggleBit();
                 return true;
+            }
+
+            const double ly = editRowY(5);
+            if (y >= ly && y <= ly + 24.0)
+            {
+                if (x >= kMinusX && x <= kPlusX + 26.0)
+                    toggleLoop();
+                return true;
             }	    
 	    
             return true;
         }	
 
-	// Waveform: click or drag to set the start point.
+        // Waveform: top half = start/end markers, bottom half = loop markers.
         if (!fPeakMin.empty() && x >= 20 && x <= kColW - 20
                               && y >= kWaveTop && y <= kWaveTop + kWaveH)
         {
-            fDraggingStart = true;
-            editParameter(slotParam(fSel, 4), true); // tells the host a gesture started
-            setStartFromX(x);
+            const SlotInfo& s = fSlot[fSel];
+            const float f = std::min(1.0f, std::max(0.0f, static_cast<float>((x - 20.0) / (kColW - 40.0))));
+            const bool top = y < kWaveTop + kWaveH * 0.5;
+
+            const float a = top ? s.start : s.loopStart;
+            const float b = top ? s.endPt : s.loopEnd;
+            const float da = std::fabs(f - a);
+            const float db = std::fabs(f - b);
+
+            int which;
+            if (da < db)      which = 0;
+            else if (db < da) which = 1;
+            else              which = (f > a) ? 1 : 0; // markers stacked: pick by side
+
+            fDragMarker = (top ? 0 : 2) + which;
+            editParameter(markerParam(fDragMarker), true);
+            setMarkerFromX(x);
             return true;
-        }
+        }	
 
         // File list: click to select a row.
         if (x >= 20 && x <= kColW - 20 && y >= kListTop && y < listBottom())
@@ -217,10 +241,10 @@ protected:
 
     bool onMotion(const MotionEvent& ev) override
     {
-        if (!fDraggingStart)
+        if (fDragMarker < 0)
             return false;
 
-        setStartFromX(ev.pos.getX());
+        setMarkerFromX(ev.pos.getX());
         return true;
     }  
 
@@ -491,12 +515,30 @@ protected:
 
             drawButton(s.bit8 ? "8-BIT" : "16-BIT", kMinusX, by8, kPlusX + 26.0f - kMinusX, 24.0f,
                        s.bit8 ? Color(200, 150, 40) : Color(70, 70, 80));
+        }
+
+        {
+            const float ly = editRowY(5);
+
+            fontSize(12.0f);
+            fillColor(Color(220, 220, 225));
+            textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+            text(kSlotX, ly + 12.0f, "LOOP", nullptr);
+
+            char lb[48];
+            if (s.loopOn)
+                std::snprintf(lb, sizeof(lb), "ON  %.3f - %.3f s", s.loopStart * s.sec, s.loopEnd * s.sec);
+            else
+                std::snprintf(lb, sizeof(lb), "OFF");
+
+            drawButton(lb, kMinusX, ly, kPlusX + 26.0f - kMinusX, 24.0f,
+                       s.loopOn ? Color(60, 110, 190) : Color(70, 70, 80));
         }	
 
         fontSize(11.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(kSlotX, editRowY(4) + 44.0f,
+        text(kSlotX, editRowY(5) + 40.0f,
              "Click +/-: 1 step (Shift: octave / 6 dB)   Wheel: 1 step   Click gain value: reset", nullptr);	
 
     }  
@@ -622,6 +664,22 @@ protected:
             return;
         }
 
+        if (index >= kEndParam)
+        {
+            const uint32_t g = (index - kEndParam) / 16;
+            const uint32_t s = (index - kEndParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlot[s].endPt     = value;       break;
+            case 1: fSlot[s].loopStart = value;       break;
+            case 2: fSlot[s].loopEnd   = value;       break;
+            case 3: fSlot[s].loopOn    = value > 0.5f; break;
+            }
+            repaint();
+            return;
+        }      
+
         if (index >= kBitParam)
         {
             if (index - kBitParam < 16)
@@ -718,15 +776,16 @@ private:
     int   fScanTick  = 0;
 
     std::vector<float> fPeakMin, fPeakMax;
-    bool  fDraggingStart = false;
 
-      struct SlotInfo
+  struct SlotInfo
     {
         std::string name;
         int   root = 60, lo = 0, hi = 127;
         float sec = 0.0f, start = 0.0f;
       float gain = 0.0f;
       bool bit8 = false;
+        float endPt = 1.0f, loopStart = 0.0f, loopEnd = 1.0f;
+        bool  loopOn = false;      
     };
 
     SlotInfo fSlot[16];
@@ -735,6 +794,27 @@ private:
 
     int fLearn        = -1;  // -1 = off, else the field being learned (1 root, 2 low, 3 high)
     int fLastLearnVal = -1;
+
+    int fDragMarker = -1; // -1 none, 0 start, 1 end, 2 loop start, 3 loop end
+
+    uint32_t markerParam(int m) const
+    {
+        switch (m)
+        {
+        case 0:  return slotParam(fSel, 4);
+        case 1:  return kEndParam + fSel;
+        case 2:  return kEndParam + 16 + fSel;
+        default: return kEndParam + 32 + fSel;
+        }
+    }
+
+    void toggleLoop()
+    {
+        bool& b = fSlot[fSel].loopOn;
+        b = !b;
+        setParameterValue(kEndParam + 48 + fSel, b ? 1.0f : 0.0f);
+        repaint();
+    }  
 
     void handleLearnValue(int v)
     {
@@ -814,11 +894,22 @@ private:
         repaint();
     }
 
-  void setStartFromX(double x)
+  void setMarkerFromX(double x)
     {
-        const float f = (static_cast<float>(x) - 20.0f) / (kColW - 40.0f);
-        fSlot[fSel].start = std::min(1.0f, std::max(0.0f, f));
-        setParameterValue(slotParam(fSel, 4), fSlot[fSel].start);
+        const float f = std::min(1.0f, std::max(0.0f, (static_cast<float>(x) - 20.0f) / (kColW - 40.0f)));
+        SlotInfo& s = fSlot[fSel];
+        float v = f;
+
+        switch (fDragMarker)
+        {
+        case 0: v = s.start     = std::min(f, s.endPt);     break;
+        case 1: v = s.endPt     = std::max(f, s.start);     break;
+        case 2: v = s.loopStart = std::min(f, s.loopEnd);   break;
+        case 3: v = s.loopEnd   = std::max(f, s.loopStart); break;
+        default: return;
+        }
+
+        setParameterValue(markerParam(fDragMarker), v);
         repaint();
     }
 
@@ -879,7 +970,9 @@ private:
         if (!fPeakMin.empty())
         {
             char buf[40];
-            std::snprintf(buf, sizeof(buf), "START %.3f s", fSlot[fSel].start * fSlot[fSel].sec);
+            std::snprintf(buf, sizeof(buf), "START %.3f  END %.3f s",
+                          fSlot[fSel].start * fSlot[fSel].sec,
+                          fSlot[fSel].endPt * fSlot[fSel].sec);	    
 
             fontSize(12.0f);
             fillColor(Color(140, 140, 150));
@@ -946,29 +1039,68 @@ private:
         strokeWidth(1.0f);
         stroke();
 
-        // Dim the part before the start point, since it will be skipped.
-        const float sx = x + w * fSlot[fSel].start;
+        const SlotInfo& si = fSlot[fSel];
+        const float sx  = x + w * si.start;
+        const float ex  = x + w * si.endPt;
+        const float lsx = x + w * si.loopStart;
+        const float lex = x + w * si.loopEnd;
 
+        // Loop region tint (only while looping is on).
+        if (si.loopOn && lex > lsx)
+        {
+            beginPath();
+            rect(lsx, y, lex - lsx, h);
+            fillColor(80, 150, 240, 50);
+            fill();
+        }
+
+        // Dim the parts outside start..end, since they won't play.
         beginPath();
         rect(x, y, sx - x, h);
         fillColor(0, 0, 0, 120);
         fill();
 
-        // Start marker with a small handle at the top.
         beginPath();
-        moveTo(sx, y);
-        lineTo(sx, y + h);
+        rect(ex, y, x + w - ex, h);
+        fillColor(0, 0, 0, 120);
+        fill();
+
+        // Start and end markers: amber, handles at the top.
+        beginPath();
+        moveTo(sx, y);  lineTo(sx, y + h);
+        moveTo(ex, y);  lineTo(ex, y + h);
         strokeColor(Color(255, 200, 80));
         strokeWidth(2.0f);
         stroke();
 
         beginPath();
-        moveTo(sx, y);
-        lineTo(sx + 9.0f, y);
-        lineTo(sx, y + 9.0f);
-        closePath();
+        moveTo(sx, y);  lineTo(sx + 9.0f, y);  lineTo(sx, y + 9.0f);  closePath();
+        moveTo(ex, y);  lineTo(ex - 9.0f, y);  lineTo(ex, y + 9.0f);  closePath();
         fillColor(Color(255, 200, 80));
         fill();
+
+        // Loop markers: blue (grey while looping is off), handles at the bottom.
+        const Color lc = si.loopOn ? Color(80, 150, 240) : Color(100, 108, 125);
+
+        beginPath();
+        moveTo(lsx, y);  lineTo(lsx, y + h);
+        moveTo(lex, y);  lineTo(lex, y + h);
+        strokeColor(lc);
+        strokeWidth(1.0f);
+        stroke();
+
+        const float by = y + h;
+        beginPath();
+        moveTo(lsx, by);  lineTo(lsx + 9.0f, by);  lineTo(lsx, by - 9.0f);  closePath();
+        moveTo(lex, by);  lineTo(lex - 9.0f, by);  lineTo(lex, by - 9.0f);  closePath();
+        fillColor(lc);
+        fill();
+
+        // Hint under the panel.
+        fontSize(10.0f);
+        fillColor(Color(140, 140, 150));
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        text(x, y + h + 9.0f, "Top half: start / end    Bottom half: loop start / end", nullptr);
     }  
 
     float listBottom() const { return getHeight() - 160.0f; }

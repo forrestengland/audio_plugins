@@ -33,7 +33,7 @@ class ExamplePluginMeters : public MidiMonitorPlugin
 {
 public:
     ExamplePluginMeters()
-        : MidiMonitorPlugin(117, 0, 19),
+        : MidiMonitorPlugin(181, 0, 19),
           fColor(0.0f),
           fOutLeft(0.0f),
           fOutRight(0.0f),
@@ -151,6 +151,27 @@ protected:
             parameter.ranges.max = 1048575.0f;
             return;
         }
+
+        if (index >= kEndParam)
+        {
+            static const char* const names[] = { "end", "loop-start", "loop-end", "loop" };
+            static const char* const syms[]  = { "end", "loop_start", "loop_end", "loop" };
+
+            const uint32_t g = (index - kEndParam) / 16;
+            const uint32_t s = (index - kEndParam) % 16;
+            if (g > 3) return;
+
+            char name[40], sym[40];
+            std::snprintf(name, sizeof(name), "slot%u-%s", s + 1, names[g]);
+            std::snprintf(sym,  sizeof(sym),  "s%u_%s",    s + 1, syms[g]);
+            parameter.name   = name;
+            parameter.symbol = sym;
+            parameter.hints  = (g == 3) ? (kParameterIsAutomatable|kParameterIsBoolean)
+                                        : kParameterIsAutomatable;
+            parameter.ranges.def = (g == 1 || g == 3) ? 0.0f : 1.0f; // end/loop end = 1
+            if (g == 0 || g == 2) parameter.ranges.def = 1.0f;
+            return;
+        }	
 
         if (index >= kBitParam)
         {
@@ -292,6 +313,21 @@ protected:
         if (index == kLearnParam)
             return static_cast<float>(fLearnVal.load(std::memory_order_relaxed));
 
+	if (index >= kEndParam)
+        {
+            const uint32_t g = (index - kEndParam) / 16;
+            const uint32_t s = (index - kEndParam) % 16;
+
+            switch (g)
+            {
+            case 0: return fSlots[s].endPt.load();
+            case 1: return fSlots[s].loopStart.load();
+            case 2: return fSlots[s].loopEnd.load();
+            case 3: return fSlots[s].loopOn.load() ? 1.0f : 0.0f;
+            }
+            return 0.0f;
+        }
+		
         if (index >= kBitParam)
         {
             const uint32_t s = index - kBitParam;
@@ -336,6 +372,21 @@ protected:
     */
     void setParameterValue(uint32_t index, float value) override
     {
+
+        if (index >= kEndParam)
+        {
+            const uint32_t g = (index - kEndParam) / 16;
+            const uint32_t s = (index - kEndParam) % 16;
+
+            switch (g)
+            {
+            case 0: fSlots[s].endPt.store(value);          break;
+            case 1: fSlots[s].loopStart.store(value);      break;
+            case 2: fSlots[s].loopEnd.store(value);        break;
+            case 3: fSlots[s].loopOn.store(value > 0.5f);  break;
+            }
+            return;
+        }      
 
         if (index >= kBitParam)
         {
@@ -584,6 +635,10 @@ private:
         std::atomic<float> gainDb  { 0.0f };
         std::atomic<float> gainLin { 1.0f };
       std::atomic<bool> bit8 {false};
+        std::atomic<float> endPt     { 1.0f };
+        std::atomic<float> loopStart { 0.0f };
+        std::atomic<float> loopEnd   { 1.0f };
+        std::atomic<bool>  loopOn    { false };      
     };
 
     Slot fSlots[kNumSlots];
@@ -609,6 +664,8 @@ private:
     static constexpr uint32_t kLearnParam = 84;
     static constexpr uint32_t kGainParam = 85; // 85..100 = slot gains
   static constexpr uint32_t kBitParam = 101; // 101..116 = slot 8-bit toggles
+    static constexpr uint32_t kEndParam = 117; // 117..132 end, 133..148 loop start,
+                                               // 149..164 loop end, 165..180 loop on  
 
     std::atomic<uint32_t> fLearnVal { 0 }; // (sequence * 128) + last note-on
     uint32_t fNoteSeq = 0;                 // audio thread only  
@@ -671,7 +728,6 @@ private:
         if (!stolen)
             v->env   = 0.0f;
     }
-
     void renderSamples(float** outputs, uint32_t start, uint32_t end) noexcept
     {
         for (SampleVoice& v : fVoices)
@@ -689,23 +745,35 @@ private:
 
             const float* const L = s.L.data();
             const float* const R = s.R.data();
-            const double lastPos = static_cast<double>(s.len - 1);
+            const double lastFrame = static_cast<double>(s.len - 1);
+
+            // playback end, and loop region (only used if it is at least 2 frames long)
+            const double endPos = std::min(lastFrame, std::max(0.0,
+                                  static_cast<double>(s.endPt.load(std::memory_order_relaxed)) * lastFrame));
+            const double ls = static_cast<double>(s.loopStart.load(std::memory_order_relaxed)) * lastFrame;
+            const double le = static_cast<double>(s.loopEnd.load(std::memory_order_relaxed))   * lastFrame;
+            const bool looping = s.loopOn.load(std::memory_order_relaxed) && (le - ls) >= 2.0;
+            const double loopLen = le - ls;
+
             const float target   = v.releasing ? 0.0f : 1.0f;
             const float slotGain = s.gainLin.load(std::memory_order_relaxed);
 
-            // quantize to 8 or 16 bits: round to the nearest step and clamp to the signed range
             const float qs = s.bit8.load(std::memory_order_relaxed) ? 128.0f : 32768.0f;
             auto quant = [qs](float x) noexcept
             {
-	      const float q = std::floor(x * qs + 0.5f);
-	      return std::min(qs - 1.0f, std::max(-qs, q)) / qs;
-            };	    
+                const float q = std::floor(x * qs + 0.5f);
+                return std::min(qs - 1.0f, std::max(-qs, q)) / qs;
+            };
 
             for (uint32_t i = start; i < end; ++i)
             {
                 v.env += (target - v.env) * 0.01f;
 
-                if (v.pos >= lastPos || (v.releasing && v.env < 0.0005f))
+                // wrap at the loop end; the loop end replaces the sample end while looping
+                if (looping && v.pos >= le)
+                    v.pos = ls + std::fmod(v.pos - ls, loopLen);
+
+                if ((!looping && v.pos >= endPos) || (v.releasing && v.env < 0.0005f))
                 {
                     v.active = false;
                     break;
@@ -719,7 +787,7 @@ private:
                 const float r0 = quant(R[idx]), r1 = quant(R[idx + 1]);
 
                 outputs[0][i] += (l0 + (l1 - l0) * frac) * amp;
-                outputs[1][i] += (r0 + (r1 - r0) * frac) * amp;		
+                outputs[1][i] += (r0 + (r1 - r0) * frac) * amp;
 
                 v.pos += v.step;
             }
