@@ -109,7 +109,7 @@ public:
     fMidiMonitor = dynamic_cast<MidiMonitorPlugin*>(plugin);
 #endif
 
-    scanSamples();
+    scanFiles();
   }
 
 protected:
@@ -137,10 +137,30 @@ protected:
             }	    
 	    
             return false;
-        }
+        }	
 	
         const double x = ev.pos.getX();
         const double y = ev.pos.getY();
+
+	// File browser tabs.
+	const float tabY = kListTop - 32.0f;
+
+	if (x >= 20 && x <= kColW - 20 &&
+	    y >= tabY && y <= tabY + 24.0f)
+	  {
+	    const bool projectTab = x >= 210.0f;
+
+	    if (projectTab != fProjectTab)
+	      {
+		fProjectTab = projectTab;
+		fSelected.clear();
+		fFirstRow = 0;
+		scanFiles();
+		repaint();
+	      }
+
+	    return true;
+	  }	
 
         // Text field: click inside to edit, click anywhere else to stop editing.
         const double fy = getHeight() - 148.0;
@@ -283,8 +303,19 @@ protected:
 
             if (row < visibleRows() && idx < static_cast<int>(fFiles.size()))
             {
-                fSelected = fFiles[idx];
-                repaint();
+	      fSelected = fFiles[idx];
+
+	      if (fProjectTab)
+		{
+		  fName = fSelected.substr(
+					   0, fSelected.size() - 7
+					   );
+
+		  commitName();
+		}
+
+	      repaint();	      
+
             }
             return true;
         }	
@@ -303,23 +334,53 @@ protected:
             return true;
         }
 
-        if (x >= 130 && x <= 230)
-        {
-            char buf[16];
-            std::snprintf(buf, sizeof(buf), "%u", ++fSaveCount);
-            setState("save", buf);
-            return true;
-        }
+	if (x >= 130 && x <= 230)
+	  {
+	    if (fProjectTab)
+	      {
+		savePreset();
+	      }
+	    else
+	      {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%u", ++fSaveCount);
+		setState("save", buf);
+	      }
 
+	    return true;
+	  }
+
+	// load
 	if (x >= 240 && x <= 340)
-        {
-            if (!fSelected.empty() && loadPeaks(fSelected))
-            {
-                fSlot[fSel].name = fSelected;
-                setState(("slot" + std::to_string(fSel + 1)).c_str(), fSelected.c_str());
-            }
-            return true;
-        }
+	  {
+	    if (fProjectTab)
+	      {
+		if (!fSelected.empty())
+		  {
+		    fName = fSelected.substr(
+					     0, fSelected.size() - 7
+					     );
+
+		    commitName();
+		  }
+
+		loadPreset();
+	      }
+	    else
+	      {
+		if (!fSelected.empty() && loadPeaks(fSelected))
+		  {
+		    fSlot[fSel].name = fSelected;
+
+		    setState(
+			     ("slot" + std::to_string(fSel + 1)).c_str(),
+			     fSelected.c_str()
+			     );
+		  }
+	      }
+
+	    return true;
+	  }	
 
         return false;
     }
@@ -451,7 +512,7 @@ protected:
         if (++fScanTick >= 60)
         {
             fScanTick = 0;
-            scanSamples();
+            scanFiles();
         }
       
         if (fMidiMonitor == nullptr)
@@ -855,12 +916,22 @@ protected:
         const float by = height - 108.0f;
         drawButton(fRecording ? "STOP" : "REC", 20, by, 100, 24,
                    fRecording ? Color(200, 60, 60) : Color(70, 70, 80));
+
         drawButton("SAVE", 130, by, 100, 24, Color(70, 70, 80));
 
-	char loadLabel[16];
-        std::snprintf(loadLabel, sizeof(loadLabel), "LOAD > %d", fSel + 1);
-        drawButton(loadLabel, 240, by, 100, 24,
-                   fSelected.empty() ? Color(55, 55, 62) : Color(70, 70, 80));
+	char loadLabel[32];
+
+	if (fProjectTab)
+	  std::snprintf(loadLabel, sizeof(loadLabel), "LOAD PROJECT");
+	else
+	  std::snprintf(loadLabel, sizeof(loadLabel), "LOAD > %d", fSel + 1);
+
+	drawButton(
+		   loadLabel, 240, by, 100, 24,
+		   fSelected.empty() && fProjectTab
+		   ? Color(55, 55, 62)
+		   : Color(70, 70, 80)
+		   );	
 
 	// Level meters, anchored to the bottom of the window.
         fontSize(12.0f);
@@ -1026,7 +1097,7 @@ protected:
         else if (std::strcmp(key, "folder") == 0)
         {
             fFolder = value;
-            scanSamples();
+            scanFiles();
 	}
         else if (std::strncmp(key, "slot", 4) == 0)
         {
@@ -1062,6 +1133,7 @@ private:
     int   fFirstRow  = 0;
     float fScrollAcc = 0.0f;
     int   fScanTick  = 0;
+  bool fProjectTab = false;  // false = Samples, true = Projects  
 
     std::vector<float> fPeakMin, fPeakMax;  
 
@@ -1149,6 +1221,16 @@ private:
             std::printf("No preset %s\n", path.c_str());
             return;
         }
+
+	// Clear all existing sample slots before restoring this project.
+	for (uint32_t i = 0; i < 16; ++i)
+	  {
+	    fSlot[i].name.clear();
+
+	    char key[16];
+	    snprintf(key, sizeof(key), "slot%u", (unsigned)i);
+	    setState(key, "");
+	  }	
 
         char line[512];
 
@@ -1579,10 +1661,10 @@ private:
         fill();
 
         // Hint under the panel.
-        fontSize(10.0f);
+	/*        fontSize(10.0f);
         fillColor(Color(140, 140, 150));
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(x, y + h + 9.0f, "Top half: start / end    Bottom half: loop start / end", nullptr);
+        text(x, y + h + 9.0f, "Top half: start / end    Bottom half: loop start / end", nullptr); */
     }  
 
     float listBottom() const { return getHeight() - 160.0f; }
@@ -1609,6 +1691,21 @@ private:
         return std::string(home ? home : ".") + "/Samples";
     }
 
+  static bool hasProjectExtension(const std::string& n)
+  {
+    if (n.size() < 7)
+      return false;
+
+    std::string ext = n.substr(n.size() - 7);
+
+    for (char& c : ext)
+      c = static_cast<char>(
+			    std::tolower(static_cast<unsigned char>(c))
+			    );
+
+    return ext == ".mirage";
+  }  
+
     static bool hasWavExtension(const std::string& n)
     {
         if (n.size() < 5)
@@ -1621,30 +1718,38 @@ private:
         return ext == ".wav";
     }
 
-    void scanSamples()
-    {
-        std::vector<std::string> found;
+  void scanFiles()
+  {
+    std::vector<std::string> found;
 
-        if (DIR* const dir = opendir(samplesFolder().c_str()))
-        {
-            while (const dirent* const e = readdir(dir))
-            {
-                const std::string n = e->d_name;
-                if (hasWavExtension(n))
-                    found.push_back(n);
-            }
-            closedir(dir);
-        }
+    const std::string folder =
+      fProjectTab ? presetFolder() : samplesFolder();
 
-        std::sort(found.begin(), found.end());
+    if (DIR* const dir = opendir(folder.c_str()))
+      {
+        while (const dirent* const e = readdir(dir))
+	  {
+            const std::string n = e->d_name;
 
-        if (found != fFiles)
-        {
-            fFiles.swap(found);
-            clampScroll();
-            repaint();
-        }
-    }
+            if ((!fProjectTab && hasWavExtension(n)) ||
+                ( fProjectTab && hasProjectExtension(n)))
+	      {
+                found.push_back(n);
+	      }
+	  }
+
+        closedir(dir);
+      }
+
+    std::sort(found.begin(), found.end());
+
+    if (found != fFiles)
+      {
+        fFiles.swap(found);
+        clampScroll();
+        repaint();
+      }
+  }  
 
     void drawFileList(float width)
     {
@@ -1656,30 +1761,38 @@ private:
         const int   rows = visibleRows();
         const int   count = static_cast<int>(fFiles.size());
 
-        // Header and file count.
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%d files", count);
+	// Tabs.
+	const float tabY = kListTop - 32.0f;
 
-        fontSize(14.0f);
-        fillColor(Color(100, 220, 140));
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(x, kListTop - 18.0f, "SAMPLES", nullptr);
+	drawButton(
+		   "SAMPLES",
+		   20.0f, tabY, 180.0f, 24.0f,
+		   !fProjectTab ? Color(55, 105, 75) : Color(55, 55, 65)
+		   );
 
-        fontSize(12.0f);
-        fillColor(Color(140, 140, 150));
-        textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
-        text(x + w, kListTop - 18.0f, buf, nullptr);
+	drawButton(
+		   "PROJECTS",
+		   210.0f, tabY, 180.0f, 24.0f,
+		   fProjectTab ? Color(55, 105, 75) : Color(55, 55, 65)
+		   );
 
-        char mem[40];
+	/*	char buf[32];
+	std::snprintf(buf, sizeof(buf), "%d files", count);
+
+	fontSize(12.0f);
+	fillColor(Color(140, 140, 150));
+	textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
+	text(x + w, kListTop - 18.0f, buf, nullptr);	*/
+
+	// show sample memory usage
+	/*        char mem[40];
         if (fSlot[fSel].sec > 0.0f)
             std::snprintf(mem, sizeof(mem), "SLOT %d  %.2f s", fSel + 1, fSlot[fSel].sec);
         else
             std::snprintf(mem, sizeof(mem), "SLOT %d  empty", fSel + 1);
 
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(x + 90.0f, kListTop - 18.0f, mem, nullptr);
-        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
-        text(x + 90.0f, kListTop - 18.0f, mem, nullptr);	
+        text(x + 90.0f, kListTop - 18.0f, mem, nullptr); */
 
         // Panel.
         beginPath();
@@ -1693,7 +1806,7 @@ private:
         if (count == 0)
         {
             fillColor(Color(140, 140, 150));
-            text(x + 8.0f, kListTop + kRowH * 0.5f, "No .wav files found", nullptr);
+            text(x + 8.0f, kListTop + kRowH * 0.5f, fProjectTab ? "No projects found" : "No .wav files found", nullptr);
             return;
         }
 
