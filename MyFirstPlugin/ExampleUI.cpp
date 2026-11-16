@@ -184,12 +184,12 @@ protected:
         if (x >= kSlotX && x <= kSlotX + kSlotW)
         {
 
-            if (y >= 8.0 && y <= 28.0)
+	  /*            if (y >= 8.0 && y <= 28.0)
             {
                 if (x >= kSlotX + 210.0 && x <= kSlotX + 280.0) savePreset();
                 if (x >= kSlotX + 290.0 && x <= kSlotX + 360.0) loadPreset();
                 return true;
-            }	  
+		}	   */
 	  
             if (y >= kSlotTop && y < kSlotTop + 16 * kSlotRowH)
             {
@@ -546,8 +546,8 @@ protected:
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
         text(kSlotX, 30.0f, "SAMPLE SLOTS", nullptr);
 
-        drawButton("SAVE SET", kSlotX + 210.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));
-        drawButton("LOAD SET", kSlotX + 290.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));	
+	//        drawButton("SAVE SET", kSlotX + 210.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));
+	//        drawButton("LOAD SET", kSlotX + 290.0f, 8.0f, 70.0f, 20.0f, Color(70, 70, 80));	
 
         beginPath();
         roundedRect(kSlotX, kSlotTop, kSlotW, kSlotRowH * 16, 4.0f);
